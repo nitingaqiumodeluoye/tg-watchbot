@@ -1,5 +1,6 @@
 .git
 .env
+config.yaml
 .venv
 __pycache__
 *.pyc
@@ -8,4 +9,5 @@ __pycache__
 *.sqlite3
 *.sqlite3-*
 *.log
+*.pid
 memory.md

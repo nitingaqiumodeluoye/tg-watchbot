@@ -3,8 +3,7 @@ services:
     build: .
     container_name: tg-watchbot
     restart: unless-stopped
-    ports:
-      - "8765:8765"
+    network_mode: host
     env_file:
       - .env
     environment:
