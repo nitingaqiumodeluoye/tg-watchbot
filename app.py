@@ -14,6 +14,7 @@ import base64
 import hashlib
 import html
 import io
+import json
 import logging
 import os
 import re
@@ -28,8 +29,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import quote_plus, urlencode, urljoin
 import os.path as ospath
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import feedparser
 import httpx
@@ -37,17 +39,27 @@ import yaml
 import qrcode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bs4 import BeautifulSoup
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError
+try:
+    from aiogram.exceptions import TelegramBadRequest
+except Exception:  # pragma: no cover - import stubs or older aiogram layouts
+    TelegramBadRequest = TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 from aiogram.client.default import DefaultBotProperties
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse, PlainTextResponse
 import uvicorn
+
+try:
+    from aiogram.client.session.aiohttp import AiohttpSession
+except Exception:  # pragma: no cover - import stubs or older aiogram layouts
+    AiohttpSession = None
 
 try:
     from telethon import TelegramClient, events
@@ -62,10 +74,29 @@ DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
 CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
+
+
+def telegram_proxy_url() -> str | None:
+    for key in ("TELEGRAM_PROXY_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = os.getenv(key, "").strip()
+        if value.lower().startswith(("http://", "https://")):
+            return value
+    return None
+
+
+def create_bot_client(token: str) -> Bot:
+    proxy = telegram_proxy_url()
+    session = AiohttpSession(proxy=proxy) if proxy and AiohttpSession else None
+    if proxy and AiohttpSession:
+        logger.info("telegram bot client using proxy %s", proxy)
+    elif proxy:
+        logger.warning("telegram proxy configured but aiogram AiohttpSession is unavailable")
+    return Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 MIN_INTERVAL_SECONDS = 60
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
 DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS = 30
 DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS = 300
+DEFAULT_MONITOR_TIMEZONE = "Asia/Shanghai"
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -86,6 +117,8 @@ user_session_client: Any = None
 channel_media_clients: dict[str, Any] = {}
 telegram_qr_logins: dict[str, dict[str, Any]] = {}
 GROUP_SUMMARY_MAX_CHARS = 800
+cf_cookie_cache: dict[str, dict[str, Any]] = {}
+DEFAULT_CF_DIRECT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -121,6 +154,43 @@ def monitor_cleanup_settings() -> dict[str, int | bool]:
             ),
         ),
     }
+
+
+def parse_hhmm(value: Any, default: str) -> int:
+    text = str(value or default).strip()
+    try:
+        hour_text, minute_text = text.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour * 60 + minute
+    except Exception:
+        pass
+    logger.warning("invalid quiet hour time %r, using %s", value, default)
+    fallback_hour, fallback_minute = [int(part) for part in default.split(":", 1)]
+    return fallback_hour * 60 + fallback_minute
+
+
+def monitor_scan_paused(now: datetime | None = None) -> tuple[bool, str]:
+    monitoring = (config.get("monitoring") or {}) if isinstance(config, dict) else {}
+    quiet = monitoring.get("quiet_hours") or {}
+    if not bool(quiet.get("enabled", False)):
+        return False, ""
+    tz_name = str(quiet.get("timezone") or DEFAULT_MONITOR_TIMEZONE)
+    try:
+        tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        logger.warning("invalid quiet hour timezone %r, using %s", tz_name, DEFAULT_MONITOR_TIMEZONE)
+        tz_name = DEFAULT_MONITOR_TIMEZONE
+        tz = ZoneInfo(tz_name)
+    current = (now or datetime.now(timezone.utc)).astimezone(tz)
+    current_minutes = current.hour * 60 + current.minute
+    start = parse_hhmm(quiet.get("start"), "01:00")
+    end = parse_hhmm(quiet.get("end"), "07:00")
+    if start == end:
+        return False, ""
+    paused = start <= current_minutes < end if start < end else current_minutes >= start or current_minutes < end
+    return paused, f"{quiet.get('start', '01:00')}-{quiet.get('end', '07:00')} {tz_name}"
 
 
 def db() -> sqlite3.Connection:
@@ -2142,10 +2212,223 @@ def item_blocked(item: MonitorItem, monitor: dict[str, Any]) -> tuple[bool, str]
     return False, ""
 
 
-async def fetch_url(client: httpx.AsyncClient, url: str) -> str:
+def cf_bypass_base_url(monitor: dict[str, Any]) -> str:
+    value = str(monitor.get("cf_bypass_url") or "").strip()
+    if value:
+        return value.rstrip("/")
+    monitoring = (config.get("monitoring") or {}) if isinstance(config, dict) else {}
+    value = str(monitoring.get("cf_bypass_url") or os.getenv("CF_BYPASS_URL") or "").strip()
+    return value.rstrip("/")
+
+
+def monitor_fetch_url(monitor: dict[str, Any]) -> str:
+    url = str(monitor.get("url") or "").strip()
+    if not bool(monitor.get("cf_bypass")):
+        return url
+    base_url = cf_bypass_base_url(monitor)
+    if not base_url:
+        return url
+    return f"{base_url}/html?{urlencode({'url': url})}"
+
+
+def cf_cache_key(monitor: dict[str, Any]) -> str:
+    return hashlib.sha256(str(monitor.get("url") or "").encode("utf-8", errors="ignore")).hexdigest()
+
+
+def cf_cache_ttl_seconds(monitor: dict[str, Any]) -> int:
+    return max(60, safe_int(monitor.get("cf_cookie_ttl_seconds"), 90 * 60))
+
+
+def cf_configured_cookies(monitor: dict[str, Any]) -> dict[str, str]:
+    raw = monitor.get("cf_cookies") or {}
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items() if str(k).strip() and str(v).strip()}
+    if not isinstance(raw, str):
+        return {}
+    cookies: dict[str, str] = {}
+    for part in raw.split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key and value:
+            cookies[key] = value
+    return cookies
+
+
+def cf_cached_session(monitor: dict[str, Any]) -> dict[str, Any] | None:
+    cached = cf_cookie_cache.get(cf_cache_key(monitor))
+    if not cached:
+        return None
+    if time.time() >= float(cached.get("expires_at", 0)):
+        cf_cookie_cache.pop(cf_cache_key(monitor), None)
+        return None
+    if not cached.get("cookies") or not cached.get("user_agent"):
+        return None
+    configured_cookies = cf_configured_cookies(monitor)
+    if configured_cookies:
+        cached = {**cached, "cookies": {**configured_cookies, **cached["cookies"]}}
+    return cached
+
+
+def cf_impersonate_for_user_agent(user_agent: str) -> str:
+    ua = (user_agent or "").lower()
+    if "firefox" in ua:
+        match = re.search(r"firefox/(\d+)", ua)
+        version = safe_int(match.group(1), 0) if match else 0
+        if version and version <= 144:
+            return "firefox144"
+        return "firefox147"
+    if "chrome" in ua or "chromium" in ua:
+        match = re.search(r"(?:chrome|chromium)/(\d+)", ua)
+        version = safe_int(match.group(1), 0) if match else 0
+        if version and version <= 124:
+            return "chrome124"
+        if version and version <= 145:
+            return "chrome145"
+        return "chrome146"
+    if "safari" in ua and "chrome" not in ua:
+        return "safari"
+    return "firefox"
+
+
+def cf_direct_proxy_url(monitor: dict[str, Any]) -> str | None:
+    value = str(monitor.get("cf_direct_proxy_url") or "").strip()
+    if value.lower() in {"", "none", "false", "off", "0"}:
+        return None
+    if value.lower().startswith(("http://", "https://", "socks4://", "socks5://", "socks5h://")):
+        return value
+    for key in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        value = os.getenv(key, "").strip()
+        if value.lower().startswith(("http://", "https://", "socks4://", "socks5://", "socks5h://")):
+            return value
+    return None
+
+
+def looks_like_cloudflare_challenge(status_code: int, body: str) -> bool:
+    if status_code in {403, 429, 521, 522, 523}:
+        return True
+    text = (body or "")[:12000].lower()
+    return any(
+        marker in text
+        for marker in (
+            "just a moment",
+            "cf-turnstile",
+            "cf_chl",
+            "cloudflare challenge",
+            "enable javascript and cookies",
+            "cf-mitigated",
+        )
+    )
+
+
+def update_cf_cookie_cache(monitor: dict[str, Any], response: httpx.Response) -> None:
+    raw_cookies = response.headers.get("x-cf-bypasser-cookies-json", "").strip()
+    user_agent = response.headers.get("x-cf-bypasser-user-agent", "").strip()
+    if not raw_cookies or not user_agent:
+        return
+    try:
+        cookies = json.loads(raw_cookies)
+    except Exception:
+        logger.warning("invalid bypass cookie header for monitor %s", monitor.get("name"))
+        return
+    if not isinstance(cookies, dict) or not cookies:
+        return
+    cf_cookie_cache[cf_cache_key(monitor)] = {
+        "cookies": {str(k): str(v) for k, v in cookies.items()},
+        "user_agent": user_agent,
+        "impersonate": cf_impersonate_for_user_agent(user_agent),
+        "expires_at": time.time() + cf_cache_ttl_seconds(monitor),
+    }
+
+
+async def refresh_cf_cookie_cache(client: httpx.AsyncClient, monitor: dict[str, Any]) -> bool:
+    base_url = cf_bypass_base_url(monitor)
+    target_url = str(monitor.get("url") or "").strip()
+    if not base_url or not target_url:
+        return False
+    endpoint = f"{base_url}/cookies?{urlencode({'url': target_url})}"
+    try:
+        response = await client.get(endpoint, follow_redirects=True)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        logger.warning("cf cookie refresh failed monitor=%s error=%s", monitor.get("name"), e)
+        return False
+    cookies = data.get("cookies") if isinstance(data, dict) else None
+    user_agent = str(data.get("user_agent") or "").strip() if isinstance(data, dict) else ""
+    if not isinstance(cookies, dict) or not cookies or not user_agent:
+        logger.warning("cf cookie refresh returned incomplete data monitor=%s", monitor.get("name"))
+        return False
+    cf_cookie_cache[cf_cache_key(monitor)] = {
+        "cookies": {str(k): str(v) for k, v in cookies.items()},
+        "user_agent": user_agent,
+        "impersonate": cf_impersonate_for_user_agent(user_agent),
+        "expires_at": time.time() + cf_cache_ttl_seconds(monitor),
+    }
+    cf_names = [str(k) for k in cookies if str(k).startswith(("cf_", "__cf"))]
+    logger.info("cf cookie cache refreshed monitor=%s cookies=%s", monitor.get("name"), cf_names)
+    return True
+
+
+async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | None:
+    cached = cf_cached_session(monitor)
+    if not cached:
+        return None
+    user_agent = str(cached["user_agent"])
+    impersonate = str(cached.get("impersonate") or cf_impersonate_for_user_agent(user_agent))
+    headers = {
+        "User-Agent": user_agent,
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    proxy_url = cf_direct_proxy_url(monitor)
+    async with CurlAsyncSession(impersonate=impersonate, headers=headers, timeout=timeout) as session:
+        response = await session.get(str(monitor.get("url") or ""), cookies=cached["cookies"], proxy=proxy_url, allow_redirects=True)
+    body = response.text
+    if looks_like_cloudflare_challenge(int(response.status_code), body):
+        logger.info("cf cached direct fetch rejected monitor=%s status=%s, refreshing via bypass", monitor.get("name"), response.status_code)
+        cf_cookie_cache.pop(cf_cache_key(monitor), None)
+        return None
+    response.raise_for_status()
+    logger.info("cf cached direct fetch ok monitor=%s status=%s impersonate=%s", monitor.get("name"), response.status_code, impersonate)
+    return body
+
+
+async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | str) -> str:
+    if isinstance(monitor_or_url, dict) and monitor_or_url.get("cf_bypass"):
+        timeout = safe_int(getattr(client.timeout, "connect", None), int((config.get("http") or {}).get("timeout_seconds", 20)))
+        direct_body = await fetch_with_cf_cookies(monitor_or_url, timeout)
+        if direct_body is not None:
+            return direct_body
+        if await refresh_cf_cookie_cache(client, monitor_or_url):
+            direct_body = await fetch_with_cf_cookies(monitor_or_url, timeout)
+            if direct_body is not None:
+                return direct_body
+        if cf_configured_cookies(monitor_or_url):
+            raise RuntimeError(f"cf logged-in fetch failed for monitor {monitor_or_url.get('name')}")
+    url = monitor_fetch_url(monitor_or_url) if isinstance(monitor_or_url, dict) else str(monitor_or_url)
     resp = await client.get(url, follow_redirects=True)
     resp.raise_for_status()
+    if isinstance(monitor_or_url, dict) and monitor_or_url.get("cf_bypass"):
+        update_cf_cookie_cache(monitor_or_url, resp)
+        timeout = safe_int(getattr(client.timeout, "connect", None), int((config.get("http") or {}).get("timeout_seconds", 20)))
+        direct_body = await fetch_with_cf_cookies(monitor_or_url, timeout)
+        if direct_body is not None:
+            return direct_body
     return resp.text
+
+
+def normalize_json_body(body: str) -> str:
+    text = (body or "").strip()
+    if text.startswith("{") or text.startswith("["):
+        return text
+    soup = BeautifulSoup(text, "html.parser")
+    pre = soup.find("pre")
+    if pre:
+        text = pre.get_text("", strip=True)
+    return html.unescape(text).strip()
 
 
 def parse_web_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
@@ -2156,6 +2439,24 @@ def parse_web_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
     price_sel = selectors.get("price")
     stock_sel = selectors.get("stock")
     soup = BeautifulSoup(body, "html.parser")
+    preloaded = soup.select_one("#data-preloaded")
+    if preloaded:
+        raw_preloaded = preloaded.get("data-preloaded") or preloaded.get_text("", strip=True)
+        try:
+            preloaded_data = json.loads(html.unescape(raw_preloaded))
+            topic_list = preloaded_data.get("topic_list") if isinstance(preloaded_data, dict) else None
+            if isinstance(topic_list, str):
+                topic_body = topic_list
+            elif isinstance(topic_list, dict):
+                topic_body = json.dumps(topic_list)
+            else:
+                topic_body = ""
+            if topic_body:
+                items = parse_json_items(monitor, topic_body)
+                if items:
+                    return items
+        except Exception:
+            logger.debug("failed to parse discourse preloaded topic list for monitor %s", monitor.get("name"), exc_info=True)
     nodes = soup.select(item_sel)[:100]
     if not nodes:
         nodes = [soup]
@@ -2182,6 +2483,52 @@ def parse_web_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
         if title or text:
             key = stable_key(link, title or text[:80])
             items.append(MonitorItem(key=key, title=title or "(no title)", link=link, text=text, price=price, stock=stock))
+    return items
+
+
+def parse_json_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
+    payload = json.loads(normalize_json_body(body))
+    topic_list = payload.get("topic_list") if isinstance(payload, dict) else None
+    topics = topic_list.get("topics") if isinstance(topic_list, dict) else None
+    users = payload.get("users") if isinstance(payload, dict) else None
+    user_map = {str(user.get("id")): user for user in users if isinstance(user, dict) and user.get("id") is not None} if isinstance(users, list) else {}
+    items: list[MonitorItem] = []
+    for topic in topics[:100] if isinstance(topics, list) else []:
+        if not isinstance(topic, dict):
+            continue
+        topic_id = str(topic.get("id") or "").strip()
+        title = str(topic.get("title") or topic.get("fancy_title") or "(no title)").strip()
+        slug = str(topic.get("slug") or "topic").strip() or "topic"
+        category_id = topic.get("category_id")
+        link = f"https://linux.do/t/{slug}/{topic_id}" if topic_id else monitor.get("url", "")
+        if category_id:
+            link += f"?category_id={category_id}"
+        posters = topic.get("posters") if isinstance(topic.get("posters"), list) else []
+        author = ""
+        if posters:
+            first_user_id = posters[0].get("user_id") if isinstance(posters[0], dict) else None
+            user = user_map.get(str(first_user_id)) if first_user_id is not None else None
+            if isinstance(user, dict):
+                author = str(user.get("username") or user.get("name") or "")
+        tags = topic.get("tags") if isinstance(topic.get("tags"), list) else []
+        category = ", ".join(str(tag.get("name") or "").strip() for tag in tags if isinstance(tag, dict) and str(tag.get("name") or "").strip())
+        published = str(topic.get("created_at") or topic.get("bumped_at") or topic.get("last_posted_at") or "")
+        stats = [
+            f"posts:{topic.get('posts_count') or 0}",
+            f"replies:{topic.get('reply_count') or 0}",
+            f"views:{topic.get('views') or 0}",
+            f"likes:{topic.get('like_count') or 0}",
+        ]
+        text_parts = [
+            title,
+            category,
+            author,
+            published,
+            " ".join(str(tag.get("name") or "") for tag in tags if isinstance(tag, dict)),
+            " ".join(stats),
+        ]
+        key = topic_id or canonical_forum_key(link, topic_id)
+        items.append(MonitorItem(key=key, title=title, link=link, text=" ".join(part for part in text_parts if part), author=author, published=published, category=category))
     return items
 
 
@@ -2304,6 +2651,13 @@ def record_monitor_message(
         conn.commit()
 
 
+def is_missing_delete_message_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    if "message to delete not found" not in text:
+        return False
+    return isinstance(exc, TelegramBadRequest) or "bad request" in text
+
+
 async def delete_expired_monitor_messages(delete_bot: Any, now_ts: float | None = None) -> int:
     now_value = time.time() if now_ts is None else now_ts
     with closing(db()) as conn:
@@ -2318,14 +2672,21 @@ async def delete_expired_monitor_messages(delete_bot: Any, now_ts: float | None 
         try:
             await delete_bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
         except Exception as e:
-            logger.exception("failed to delete monitor message chat_id=%s message_id=%s", row["chat_id"], row["message_id"])
-            with closing(db()) as conn:
-                conn.execute(
-                    "UPDATE monitor_messages SET delete_error=? WHERE chat_id=? AND message_id=?",
-                    (str(e)[:1000], row["chat_id"], row["message_id"]),
+            if is_missing_delete_message_error(e):
+                logger.debug(
+                    "monitor message already absent during cleanup chat_id=%s message_id=%s",
+                    row["chat_id"],
+                    row["message_id"],
                 )
-                conn.commit()
-            continue
+            else:
+                logger.exception("failed to delete monitor message chat_id=%s message_id=%s", row["chat_id"], row["message_id"])
+                with closing(db()) as conn:
+                    conn.execute(
+                        "UPDATE monitor_messages SET delete_error=? WHERE chat_id=? AND message_id=?",
+                        (str(e)[:1000], row["chat_id"], row["message_id"]),
+                    )
+                    conn.commit()
+                continue
         with closing(db()) as conn:
             conn.execute(
                 "DELETE FROM monitor_messages WHERE chat_id=? AND message_id=?",
@@ -2345,15 +2706,25 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
         logger.error("monitor %s missing url", name)
         record_monitor_runtime(name, ok=False, duration_ms=int((time.time() - started) * 1000), sent_count=0, error="missing url")
         return 0
+    paused, quiet_window = monitor_scan_paused()
+    if paused:
+        logger.info("monitor %s skipped during quiet hours %s", name, quiet_window)
+        record_monitor_runtime(name, ok=True, duration_ms=int((time.time() - started) * 1000), sent_count=0)
+        return 0
     keywords = monitor.get("keywords") or []
     timeout = int((config.get("http") or {}).get("timeout_seconds", 20))
     ua = (config.get("http") or {}).get("user_agent") or DEFAULT_UA
     headers = {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
     sent_count = 0
     try:
-        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            body = await fetch_url(client, url)
-        items = parse_rss_items(monitor, body) if mtype == "rss" else parse_web_items(monitor, body)
+        async with httpx.AsyncClient(timeout=timeout, headers=headers, trust_env=not bool(monitor.get("cf_bypass"))) as client:
+            body = await fetch_url(client, monitor)
+        if mtype == "rss":
+            items = parse_rss_items(monitor, body)
+        elif mtype == "json":
+            items = parse_json_items(monitor, body)
+        else:
+            items = parse_web_items(monitor, body)
         for item in items:
             blocked, block_reason = item_blocked(item, monitor)
             if blocked:
@@ -2369,7 +2740,7 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
             if not reasons:
                 continue
             # 论坛/RSS 以帖子本身作为事件键；不要把“命中原因/检查时间/编辑变化”放进去，避免同一帖重复发。
-            is_forum = monitor.get("forum") or mtype == "rss"
+            is_forum = monitor.get("forum") or mtype in {"rss", "json"}
             event_key = stable_key(name, item.key) if is_forum else stable_key(name, item.key, "|".join(reasons), item.price or "", item.stock or "")
             if not event_not_sent(event_key, name, item.title, item.link):
                 continue
@@ -2537,6 +2908,11 @@ def is_logged_in(request: Request) -> bool:
     username = os.getenv("WEB_PANEL_USER", "admin")
     token = request.cookies.get("tg_watchbot_session", "")
     return bool(token) and secrets.compare_digest(token, session_token(username))
+
+
+def request_is_https(request: Request) -> bool:
+    proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
+    return request.url.scheme == "https" or proto == "https"
 
 
 def panel_auth(request: Request) -> str:
@@ -2811,7 +3187,7 @@ def monitor_from_form(
             "stock_change": stock_change,
         },
     }
-    if mtype == "rss":
+    if mtype in {"rss", "json"}:
         m["forum"] = True
     if mtype == "web":
         selectors = {
@@ -2918,7 +3294,7 @@ pre{{white-space:pre-wrap;background:#121212;color:#fff;padding:13px;border:4px 
 @media (prefers-reduced-motion: reduce){{
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
-</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>常用</b><a href='/'>总览</a><a href='/inbox'>收件箱</a><a href='/users'>用户</a><a href='/send'>发消息</a></section><section><b>转发</b><a href='/group-monitors'>群监听</a><a href='/monitor/events'>历史</a></section><section><b>设置</b><a href='/settings'>面板设置</a><a href='/yaml'>YAML</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新</a><a href='/logs'>日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启</a><a class=logout href='/logout'>退出</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
+</style></head><body><div class=shell><aside><div class=brand><div class=mark><i></i></div><div><b>tg-watchbot</b><small>Telegram 自动化</small></div></div><nav><section><b>消息</b><a href='/inbox'>收件箱</a><a href='/users'>用户管理</a><a href='/send'>主动发消息</a><a href='/rules'>私聊广告拦截</a></section><section><b>监控</b><a href='/'>监控面板</a><a href='/monitor/new'>新增监控</a><a href='/group-monitors'>TG 群监听</a><a href='/channel-media'>频道媒体</a><a href='/monitor/events'>推送历史</a><a href='/run-once'>手动检查</a></section><section><b>配置</b><a href='/settings'>Bot / 面板设置</a><a href='/yaml'>YAML 高级编辑</a><a href='/config/export'>导入导出</a></section><section><b>系统</b><a href='/update'>更新代码</a><a href='/logs'>运行日志</a><a href='/restart' onclick='return confirm("确定重启机器人服务？")'>重启机器人</a><a class=logout href='/logout'>退出登录</a></section></nav></aside><main><div class=top><h1>{html_escape(title)}</h1><span class=badge>WatchBot Panel</span></div>
 {body}<div class=friend-links><b>友链</b><a href='https://linux.do' target='_blank' rel='noopener noreferrer'>Linux.do</a><span>·</span><a href='https://www.nodeseek.com' target='_blank' rel='noopener noreferrer'>NodeSeek</a></div></main></div></body></html>"""
 
 
@@ -2933,11 +3309,11 @@ def monitor_form_html(m: dict[str, Any] | None = None, idx: int | None = None) -
         return "checked" if no.get(k, False) else ""
     return f"""<form method=post action='{action}' class=card>{hidden}
 <div class=grid><div><label>名称</label><input name=name value='{html_escape(m.get('name',''))}' required></div>
-<div><label>类型</label><select name=mtype><option value=web {'selected' if m.get('type')=='web' else ''}>Web 网页</option><option value=rss {'selected' if m.get('type')=='rss' else ''}>RSS</option></select></div>
+<div><label>类型</label><select name=mtype><option value=web {'selected' if m.get('type')=='web' else ''}>Web 网页</option><option value=rss {'selected' if m.get('type')=='rss' else ''}>RSS</option><option value=json {'selected' if m.get('type')=='json' else ''}>JSON</option></select></div>
 <div><label>URL</label><input name=url value='{html_escape(m.get('url',''))}' required></div>
 <div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value='{html_escape(m.get('interval_seconds',60))}'></div></div>
 <label>关键词（一行一个）</label><textarea name=keywords>{html_escape(keywords)}</textarea>
-<h3>Web 选择器（RSS 可忽略）</h3><div class=grid>
+<h3>Web 选择器（RSS/JSON 可忽略）</h3><div class=grid>
 <div><label>条目选择器</label><input name=item_selector value='{html_escape(selectors.get('item','article, .thread, .post, li'))}'></div>
 <div><label>标题选择器</label><input name=title_selector value='{html_escape(selectors.get('title','h1, h2, h3, a'))}'></div>
 <div><label>链接选择器</label><input name=link_selector value='{html_escape(selectors.get('link','a'))}'></div>
@@ -3009,12 +3385,12 @@ def create_panel_app() -> FastAPI:
         return HTMLResponse(login_page())
 
     @app.post("/login")
-    async def login_post(username: str = Form(""), password: str = Form("")):
+    async def login_post(request: Request, username: str = Form(""), password: str = Form("")):
         expected_user = os.getenv("WEB_PANEL_USER", "admin")
         expected_pass = os.getenv("WEB_PANEL_PASSWORD", "admin")
         if secrets.compare_digest(username, expected_user) and secrets.compare_digest(password, expected_pass):
             resp = RedirectResponse("/", status_code=303)
-            resp.set_cookie("tg_watchbot_session", session_token(expected_user), httponly=True, secure=True, samesite="lax", max_age=60 * 60 * 24 * 14)
+            resp.set_cookie("tg_watchbot_session", session_token(expected_user), httponly=True, secure=request_is_https(request), samesite="lax", max_age=60 * 60 * 24 * 14)
             return resp
         return HTMLResponse(login_page("用户名或密码错误"), status_code=401)
 
@@ -3299,13 +3675,12 @@ def create_panel_app() -> FastAPI:
 
     @app.get("/monitor/templates", response_class=HTMLResponse)
     async def monitor_templates(_: str = Depends(panel_auth)) -> str:
-        body = """<div class=card><h2>论坛监控模板</h2><p class=muted>NodeSeek / Linux.do 建议用 RSS，不抓网页 HTML，抗 Cloudflare 更稳。</p><div class=grid><a class='btn primary' href='/monitor/template/nodeseek'>NodeSeek 新帖</a><a class='btn primary' href='/monitor/template/linuxdo'>Linux.do 最新</a><a class='btn primary' href='/monitor/template/linuxdo-resource'>Linux.do 资源荟萃</a></div></div>"""
+        body = """<div class=card><h2>论坛监控模板</h2><p class=muted>Linux.do 建议用 RSS，不抓网页 HTML，抗 Cloudflare 更稳。</p><div class=grid><a class='btn primary' href='/monitor/template/linuxdo'>Linux.do 最新</a><a class='btn primary' href='/monitor/template/linuxdo-resource'>Linux.do 资源荟萃</a></div></div>"""
         return layout("监控模板", body)
 
     @app.get("/monitor/template/{kind}", response_class=HTMLResponse)
     async def monitor_template(kind: str, _: str = Depends(panel_auth)) -> str:
         templates = {
-            "nodeseek": {"name": "NodeSeek 新帖", "type": "rss", "url": "https://rss.nodeseek.com/", "interval_seconds": 60, "keywords": ["NAT", "优惠", "补货", "VPS", "免费"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
             "linuxdo": {"name": "Linux.do 最新", "type": "rss", "url": "https://linux.do/latest.rss", "interval_seconds": 60, "keywords": ["Claude", "Codex", "API", "VPS", "NAT"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
             "linuxdo-resource": {"name": "Linux.do 资源荟萃", "type": "rss", "url": "https://linux.do/c/resource/14.rss", "interval_seconds": 60, "keywords": ["免费", "开源", "API", "Claude"], "forum": True, "notify_on": {"keyword_match": True, "new_item": True, "price_change": False, "stock_change": False}},
         }
@@ -3316,10 +3691,9 @@ def create_panel_app() -> FastAPI:
 
     @app.get("/monitor/bulk", response_class=HTMLResponse)
     async def bulk_monitor(_: str = Depends(panel_auth)) -> str:
-        sample = """NodeSeek|https://www.nodeseek.com/|免费鸡,优惠码,NAT
-Linux.do|https://linux.do|公益,codex,claude
+        sample = """Linux.do|https://linux.do|公益,codex,claude
 HostLoc|https://hostloc.com|VPS,补货,优惠"""
-        body = f"""<div class=card><h2>批量新增监控</h2><p class=muted>一行一个网站，格式：<code>名称|URL|关键词1,关键词2,关键词3</code>。</p><form method=post action='/monitor/bulk'><label>批量列表</label><textarea name=items style='min-height:260px' placeholder='{html_escape(sample)}'></textarea><div class=grid><div><label>类型</label><select name=mtype><option value=web>Web 网页</option><option value=rss>RSS</option></select></div><div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value=60></div></div><h3>默认提醒条件</h3><div class=check-row><label><input type=checkbox name=keyword_match checked> 关键词命中</label><label><input type=checkbox name=new_item checked> 新条目</label><label><input type=checkbox name=price_change> 价格变化</label><label><input type=checkbox name=stock_change> 库存变化</label></div><div class=form-actions><button class='btn primary' type=submit>批量添加</button> <a class=btn href='/'>取消</a></div></form></div>"""
+        body = f"""<div class=card><h2>批量新增监控</h2><p class=muted>一行一个网站，格式：<code>名称|URL|关键词1,关键词2,关键词3</code>。</p><form method=post action='/monitor/bulk'><label>批量列表</label><textarea name=items style='min-height:260px' placeholder='{html_escape(sample)}'></textarea><div class=grid><div><label>类型</label><select name=mtype><option value=web>Web 网页</option><option value=rss>RSS</option><option value=json>JSON</option></select></div><div><label>间隔秒数（最低 60）</label><input name=interval_seconds type=number min=60 value=60></div></div><h3>默认提醒条件</h3><div class=check-row><label><input type=checkbox name=keyword_match checked> 关键词命中</label><label><input type=checkbox name=new_item checked> 新条目</label><label><input type=checkbox name=price_change> 价格变化</label><label><input type=checkbox name=stock_change> 库存变化</label></div><div class=form-actions><button class='btn primary' type=submit>批量添加</button> <a class=btn href='/'>取消</a></div></form></div>"""
         return layout("批量新增", body)
 
     @app.post("/monitor/bulk")
@@ -3417,9 +3791,14 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         ua = (cfg.get("http") or {}).get("user_agent") or DEFAULT_UA
         headers = {"User-Agent": ua}
         try:
-            async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-                body = await fetch_url(client, m.get("url"))
-            items = parse_rss_items(m, body) if m.get("type") == "rss" else parse_web_items(m, body)
+            async with httpx.AsyncClient(timeout=timeout, headers=headers, trust_env=not bool(m.get("cf_bypass"))) as client:
+                body = await fetch_url(client, m)
+            if m.get("type") == "rss":
+                items = parse_rss_items(m, body)
+            elif m.get("type") == "json":
+                items = parse_json_items(m, body)
+            else:
+                items = parse_web_items(m, body)
             rows=[]
             for it in items[:15]:
                 blocked, br = item_blocked(it, m)
@@ -4214,7 +4593,7 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
         try:
             token, admin_chat_id = validate_env()
             admin_chat_ids = parse_admin_chat_ids(os.getenv("ADMIN_CHAT_ID", ""))
-            bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+            bot = create_bot_client(token)
         except Exception as e:
             logger.warning("run-once without Telegram notification: %s", e)
         await run_all_monitors_once()
@@ -4230,7 +4609,7 @@ async def main_async(run_once: bool = False, panel_only: bool = False) -> None:
             await asyncio.sleep(3600)
     token, admin_chat_id = validate_env()
     admin_chat_ids = parse_admin_chat_ids(os.getenv("ADMIN_CHAT_ID", ""))
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = create_bot_client(token)
     dp = Dispatcher()
     dp.include_router(router)
     scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")

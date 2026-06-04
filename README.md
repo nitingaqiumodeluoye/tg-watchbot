@@ -129,7 +129,7 @@ tg-watchbot 是一个轻量级 Python 服务，把 **Telegram 双向客服机器
 
 - 登录页 + HttpOnly session cookie，不使用丑陋的浏览器 Basic Auth。
 - 监控列表、新增、编辑、删除、手动检查、预览。
-- NodeSeek / Linux.do RSS 模板。
+- Linux.do RSS 模板。
 - 批量新增监控。
 - YAML 高级编辑。
 - Bot Token / 管理员 ID / 面板账号配置页。
@@ -446,15 +446,15 @@ RSS 示例：
 
 ```yaml
 monitors:
-  - name: NodeSeek 新帖
+  - name: Linux.do 最新
     type: rss
-    url: https://rss.nodeseek.com/
+    url: https://linux.do/latest.rss
     interval_seconds: 60
     keywords:
-      - VPS
-      - 优惠
+      - API
+      - 教程
     exclude_keywords:
-      - 出号
+      - 灌水
     authors: []
     categories: []
     notify_on:

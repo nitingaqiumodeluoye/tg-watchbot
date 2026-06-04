@@ -25,10 +25,13 @@ def install_import_stubs() -> None:
         "httpx": ModuleType("httpx"),
         "yaml": ModuleType("yaml"),
         "uvicorn": ModuleType("uvicorn"),
+        "qrcode": ModuleType("qrcode"),
         "apscheduler": ModuleType("apscheduler"),
         "apscheduler.schedulers": ModuleType("apscheduler.schedulers"),
         "apscheduler.schedulers.asyncio": ModuleType("apscheduler.schedulers.asyncio"),
         "bs4": ModuleType("bs4"),
+        "curl_cffi": ModuleType("curl_cffi"),
+        "curl_cffi.requests": ModuleType("curl_cffi.requests"),
         "dotenv": ModuleType("dotenv"),
         "aiogram": ModuleType("aiogram"),
         "aiogram.enums": ModuleType("aiogram.enums"),
@@ -37,11 +40,14 @@ def install_import_stubs() -> None:
         "aiogram.types": ModuleType("aiogram.types"),
         "aiogram.client": ModuleType("aiogram.client"),
         "aiogram.client.default": ModuleType("aiogram.client.default"),
+        "aiogram.client.session": ModuleType("aiogram.client.session"),
+        "aiogram.client.session.aiohttp": ModuleType("aiogram.client.session.aiohttp"),
         "fastapi": ModuleType("fastapi"),
         "fastapi.responses": ModuleType("fastapi.responses"),
     }
     modules["apscheduler.schedulers.asyncio"].AsyncIOScheduler = object
     modules["bs4"].BeautifulSoup = object
+    modules["curl_cffi.requests"].AsyncSession = object
     modules["dotenv"].load_dotenv = lambda *args, **kwargs: None
     modules["yaml"].safe_load = lambda stream: {"bot": {"spam_filter": {"enabled": True, "keywords": []}}}
     modules["yaml"].safe_dump = lambda data, **kwargs: str(data)
@@ -51,10 +57,12 @@ def install_import_stubs() -> None:
     modules["aiogram"].Router = DummyRouter
     modules["aiogram.enums"].ParseMode = SimpleNamespace(HTML="HTML")
     modules["aiogram.exceptions"].TelegramAPIError = Exception
+    modules["aiogram.exceptions"].TelegramBadRequest = Exception
     modules["aiogram.filters"].Command = identity_factory
     modules["aiogram.filters"].CommandObject = object
     modules["aiogram.types"].Message = object
     modules["aiogram.client.default"].DefaultBotProperties = identity_factory
+    modules["aiogram.client.session.aiohttp"].AiohttpSession = identity_factory
     modules["fastapi"].Depends = identity_factory
     modules["fastapi"].FastAPI = object
     modules["fastapi"].Form = identity_factory
@@ -80,8 +88,11 @@ class FakeBot:
         self.sent_texts: list[str] = []
         self.sent_chat_ids: list[int] = []
         self.fail_chat_ids: set[int] = set()
+        self.delete_error: Exception | None = None
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
+        if self.delete_error is not None:
+            raise self.delete_error
         self.deleted.append((chat_id, message_id))
 
     async def send_message(self, chat_id: int, text: str, disable_web_page_preview: bool = False):
@@ -207,6 +218,19 @@ class MonitorMessageCleanupTest(unittest.TestCase):
         with closing(sqlite3.connect(app.DB_PATH)) as conn:
             remaining = conn.execute("SELECT COUNT(*) FROM monitor_messages").fetchone()[0]
         self.assertEqual(1, remaining)
+
+    def test_missing_monitor_message_is_removed_from_queue_without_error(self) -> None:
+        app.record_monitor_message(1001, 2002, "NodeSeek 新帖", delete_after_seconds=60, sent_at_ts=1000)
+
+        fake_bot = FakeBot()
+        fake_bot.delete_error = RuntimeError("Telegram server says - Bad Request: message to delete not found")
+        with self.assertNoLogs("tg-watchbot", level="ERROR"):
+            deleted_count = asyncio.run(app.delete_expired_monitor_messages(fake_bot, now_ts=1061))
+
+        self.assertEqual(1, deleted_count)
+        with closing(sqlite3.connect(app.DB_PATH)) as conn:
+            remaining = conn.execute("SELECT COUNT(*) FROM monitor_messages").fetchone()[0]
+        self.assertEqual(0, remaining)
 
 
 class BotConfigurationTest(unittest.TestCase):

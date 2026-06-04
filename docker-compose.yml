@@ -5,8 +5,16 @@ services:
     restart: unless-stopped
     ports:
       - "8765:8765"
+    env_file:
+      - .env
     environment:
       WEB_PANEL_HOST: "0.0.0.0"
+      TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}}
+      HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
+      HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
+      ALL_PROXY: ""
+      all_proxy: ""
+      NO_PROXY: ${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}
     volumes:
       - ./.env:/app/.env
       - ./config.yaml:/app/config.yaml

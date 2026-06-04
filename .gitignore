@@ -4,6 +4,7 @@ memory.md
 *.log
 *.sqlite3
 *.sqlite3-*
+*.pid
 __pycache__/
 *.pyc
 .venv/

@@ -2,6 +2,13 @@ http:
   timeout_seconds: 20
   user_agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)
     Chrome/124.0 Safari/537.36 tg-watchbot/1.0
+monitoring:
+  cf_bypass_url: http://127.0.0.1:18001
+  quiet_hours:
+    enabled: true
+    start: '01:00'
+    end: '07:00'
+    timezone: Asia/Shanghai
 bot:
   rate_limit:
     window_seconds: 10
@@ -17,14 +24,14 @@ bot:
   - title: 已收到
     text: 你好，消息已收到，我稍后处理。
 monitors:
-- name: NodeSeek 新帖
+- name: Linux.do 最新
   type: rss
-  url: https://rss.nodeseek.com/
+  url: https://linux.do/latest.rss
   interval_seconds: 60
   keywords:
-  - VPS
-  - 优惠
-  - 免费
+  - API
+  - 教程
+  - 开源
   exclude_keywords: []
   authors: []
   categories: []
@@ -35,14 +42,19 @@ monitors:
     stock_change: false
   notify_telegram: true
   forum: true
-- name: Linux.do 最新
-  type: rss
-  url: https://linux.do/latest.rss
+- name: Linux.do 福利
+  type: json
+  url: https://linux.do/c/welfare/36.json
+  cf_bypass: true
   interval_seconds: 60
   keywords:
   - API
   - 教程
   - 开源
+  - 公益
+  - cdk
+  - 免费
+  - 福利
   exclude_keywords: []
   authors: []
   categories: []
