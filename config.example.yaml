@@ -4,6 +4,11 @@ http:
     Chrome/124.0 Safari/537.36 tg-watchbot/1.0
 monitoring:
   cf_bypass_url: http://127.0.0.1:18001
+  failure_alerts:
+    enabled: true
+    consecutive_failures: 10
+    notify_recovery: true
+    empty_result_is_failure: true
   quiet_hours:
     enabled: true
     start: '01:00'

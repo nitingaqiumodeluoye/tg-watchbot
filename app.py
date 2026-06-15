@@ -74,6 +74,15 @@ DB_PATH = BASE_DIR / "tg-watchbot.sqlite3"
 CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
+LINUXDO_WELFARE_JSON_URL = "https://linux.do/c/welfare/36.json"
+LINUXDO_LOGIN_TOPIC_KEYS = {
+    "can_assign",
+    "last_read_post_number",
+    "new_posts",
+    "notification_level",
+    "unread",
+    "unread_posts",
+}
 
 
 def telegram_proxy_url() -> str | None:
@@ -94,9 +103,23 @@ def create_bot_client(token: str) -> Bot:
     return Bot(token=token, session=session, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 MIN_INTERVAL_SECONDS = 60
 DEFAULT_MONITOR_MESSAGE_DELETE_AFTER_MINUTES = 60
+DEFAULT_MONITOR_FAILURE_ALERT_THRESHOLD = 10
 DEFAULT_GROUP_AI_MIN_INTERVAL_SECONDS = 30
 DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS = 300
 DEFAULT_MONITOR_TIMEZONE = "Asia/Shanghai"
+PRESERVED_MONITOR_FORM_KEYS = {
+    "authors",
+    "categories",
+    "cf_bypass",
+    "cf_bypass_url",
+    "cf_cookie_ttl_seconds",
+    "cf_cookies",
+    "cf_direct_proxy_url",
+    "exclude_keywords",
+    "failure_alert_threshold",
+    "failure_alerts_enabled",
+    "forum",
+}
 
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -118,6 +141,7 @@ channel_media_clients: dict[str, Any] = {}
 telegram_qr_logins: dict[str, dict[str, Any]] = {}
 GROUP_SUMMARY_MAX_CHARS = 800
 cf_cookie_cache: dict[str, dict[str, Any]] = {}
+cf_cookie_refresh_locks: dict[str, asyncio.Lock] = {}
 DEFAULT_CF_DIRECT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
 
 
@@ -135,7 +159,39 @@ def load_config() -> dict[str, Any]:
         raise FileNotFoundError(f"missing config: {CONFIG_PATH}")
     with CONFIG_PATH.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
+    apply_env_monitor_overrides(data)
     return data
+
+
+def normalize_cookie_value(value: Any, default_name: str = "_t") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    first = raw.split(";", 1)[0].strip()
+    if "=" not in first:
+        return f"{default_name}={raw}"
+    return raw
+
+
+def linuxdo_cookie_value() -> str:
+    return normalize_cookie_value(os.getenv("LINUXDO_COOKIE", "").strip(), "_t")
+
+
+def is_linuxdo_welfare_monitor(monitor: dict[str, Any] | None) -> bool:
+    if not isinstance(monitor, dict):
+        return False
+    return str(monitor.get("url") or "").strip() == LINUXDO_WELFARE_JSON_URL
+
+
+def apply_env_monitor_overrides(cfg: dict[str, Any]) -> None:
+    if not isinstance(cfg, dict):
+        return
+    linuxdo_cookie = linuxdo_cookie_value()
+    for monitor in cfg.get("monitors") or []:
+        if not isinstance(monitor, dict):
+            continue
+        if is_linuxdo_welfare_monitor(monitor) and linuxdo_cookie:
+            monitor["cf_cookies"] = linuxdo_cookie
 
 
 def monitor_cleanup_settings() -> dict[str, int | bool]:
@@ -191,6 +247,19 @@ def monitor_scan_paused(now: datetime | None = None) -> tuple[bool, str]:
         return False, ""
     paused = start <= current_minutes < end if start < end else current_minutes >= start or current_minutes < end
     return paused, f"{quiet.get('start', '01:00')}-{quiet.get('end', '07:00')} {tz_name}"
+
+
+def monitor_failure_alert_settings(monitor: dict[str, Any] | None = None) -> dict[str, int | bool]:
+    monitoring = (config.get("monitoring") or {}) if isinstance(config, dict) else {}
+    alerts = monitoring.get("failure_alerts") or {}
+    monitor = monitor or {}
+    threshold = monitor.get("failure_alert_threshold", alerts.get("consecutive_failures", DEFAULT_MONITOR_FAILURE_ALERT_THRESHOLD))
+    return {
+        "enabled": bool(alerts.get("enabled", True)) and bool(monitor.get("failure_alerts_enabled", True)),
+        "consecutive_failures": max(1, safe_int(threshold, DEFAULT_MONITOR_FAILURE_ALERT_THRESHOLD)),
+        "notify_recovery": bool(alerts.get("notify_recovery", True)),
+        "empty_result_is_failure": bool(alerts.get("empty_result_is_failure", True)),
+    }
 
 
 def db() -> sqlite3.Connection:
@@ -1658,7 +1727,7 @@ def record_monitor_runtime(
     duration_ms: int,
     sent_count: int,
     error: str = "",
-) -> None:
+) -> int:
     now = now_iso()
     with closing(db()) as conn:
         row = conn.execute(
@@ -1696,6 +1765,110 @@ def record_monitor_runtime(
             ),
         )
         conn.commit()
+    return failures
+
+
+def monitor_alert_meta_key(monitor_name: str) -> str:
+    return "monitor_failure_alert:" + stable_key(monitor_name)
+
+
+def monitor_failure_alert_is_active(monitor_name: str) -> bool:
+    return bool(app_meta_get(monitor_alert_meta_key(monitor_name)).strip())
+
+
+def set_monitor_failure_alert_state(monitor_name: str, failures: int, error: str) -> None:
+    app_meta_set(
+        monitor_alert_meta_key(monitor_name),
+        json.dumps({"failures": int(failures), "error": str(error)[:1000], "created_at": now_iso()}, ensure_ascii=False),
+    )
+
+
+def clear_monitor_failure_alert_state(monitor_name: str) -> None:
+    app_meta_set(monitor_alert_meta_key(monitor_name), "")
+
+
+def monitor_login_alert_meta_key(monitor_name: str) -> str:
+    return "monitor_login_alert:" + stable_key(monitor_name)
+
+
+def monitor_login_alert_is_active(monitor_name: str) -> bool:
+    return bool(app_meta_get(monitor_login_alert_meta_key(monitor_name)).strip())
+
+
+def set_monitor_login_alert_state(monitor_name: str, detail: str) -> None:
+    app_meta_set(
+        monitor_login_alert_meta_key(monitor_name),
+        json.dumps({"detail": str(detail)[:1000], "created_at": now_iso()}, ensure_ascii=False),
+    )
+
+
+def clear_monitor_login_alert_state(monitor_name: str) -> None:
+    app_meta_set(monitor_login_alert_meta_key(monitor_name), "")
+
+
+async def maybe_send_monitor_failure_alert(monitor: dict[str, Any], failures: int, error: str) -> None:
+    settings = monitor_failure_alert_settings(monitor)
+    if not settings["enabled"] or failures < int(settings["consecutive_failures"]):
+        return
+    name = str(monitor.get("name") or "unnamed")
+    if monitor_failure_alert_is_active(name):
+        return
+    text = (
+        f"[监控连续失败告警]\n"
+        f"名称：{html_escape(name)}\n"
+        f"连续失败：{failures} 次\n"
+        f"URL：{html_escape(str(monitor.get('url') or '-'))}\n"
+        f"错误：{html_escape(error or '-')}\n"
+        f"时间：{html_escape(now_iso())}"
+    )
+    if await admin_send(text):
+        set_monitor_failure_alert_state(name, failures, error)
+
+
+async def maybe_send_monitor_recovery_alert(monitor: dict[str, Any]) -> None:
+    settings = monitor_failure_alert_settings(monitor)
+    name = str(monitor.get("name") or "unnamed")
+    if not settings["enabled"] or not settings["notify_recovery"] or not monitor_failure_alert_is_active(name):
+        if monitor_failure_alert_is_active(name) and not settings["enabled"]:
+            clear_monitor_failure_alert_state(name)
+        return
+    text = (
+        f"[监控恢复]\n"
+        f"名称：{html_escape(name)}\n"
+        f"URL：{html_escape(str(monitor.get('url') or '-'))}\n"
+        f"时间：{html_escape(now_iso())}"
+    )
+    if await admin_send(text):
+        clear_monitor_failure_alert_state(name)
+
+
+async def maybe_send_monitor_login_alert(monitor: dict[str, Any], detail: str) -> None:
+    name = str(monitor.get("name") or "unnamed")
+    if monitor_login_alert_is_active(name):
+        return
+    text = (
+        f"[监控登录态失效]\n"
+        f"名称：{html_escape(name)}\n"
+        f"URL：{html_escape(str(monitor.get('url') or '-'))}\n"
+        f"说明：{html_escape(detail)}\n"
+        f"时间：{html_escape(now_iso())}"
+    )
+    if await admin_send(text):
+        set_monitor_login_alert_state(name, detail)
+
+
+async def maybe_send_monitor_login_recovery_alert(monitor: dict[str, Any]) -> None:
+    name = str(monitor.get("name") or "unnamed")
+    if not monitor_login_alert_is_active(name):
+        return
+    text = (
+        f"[监控登录态恢复]\n"
+        f"名称：{html_escape(name)}\n"
+        f"URL：{html_escape(str(monitor.get('url') or '-'))}\n"
+        f"时间：{html_escape(now_iso())}"
+    )
+    if await admin_send(text):
+        clear_monitor_login_alert_state(name)
 
 
 def list_monitor_runtime_status() -> dict[str, dict[str, Any]]:
@@ -1809,15 +1982,18 @@ def describe_sendpic_target(user_id: int) -> str:
     return f"{full_name} {username}".strip()
 
 
-async def admin_send(text: str) -> None:
+async def admin_send(text: str) -> bool:
     if not bot or not all_admin_chat_ids():
         logger.error("admin_send called before bot/admin init: %s", text)
-        return
+        return False
+    sent_any = False
     for chat_id in all_admin_chat_ids():
         try:
             await bot.send_message(chat_id, text, disable_web_page_preview=False)
+            sent_any = True
         except Exception:
             logger.exception("failed to send admin notification chat_id=%s", chat_id)
+    return sent_any
 
 
 async def admin_send_monitor(text: str, monitor_name: str) -> bool:
@@ -2221,6 +2397,16 @@ def cf_bypass_base_url(monitor: dict[str, Any]) -> str:
     return value.rstrip("/")
 
 
+def _require_cf_bypass_base_url(monitor: dict[str, Any]) -> str:
+    """Return cf_bypass_base_url or raise if cf_bypass is enabled but no base URL configured."""
+    base_url = cf_bypass_base_url(monitor)
+    if not base_url:
+        raise RuntimeError(
+            f"cf_bypass enabled for monitor {monitor.get('name')!r} but cf_bypass_url is not configured"
+        )
+    return base_url
+
+
 def monitor_fetch_url(monitor: dict[str, Any]) -> str:
     url = str(monitor.get("url") or "").strip()
     if not bool(monitor.get("cf_bypass")):
@@ -2237,6 +2423,33 @@ def cf_cache_key(monitor: dict[str, Any]) -> str:
 
 def cf_cache_ttl_seconds(monitor: dict[str, Any]) -> int:
     return max(60, safe_int(monitor.get("cf_cookie_ttl_seconds"), 90 * 60))
+
+
+def cf_refresh_timeout_seconds(monitor: dict[str, Any]) -> int:
+    return max(30, safe_int(monitor.get("cf_refresh_timeout_seconds"), 150))
+
+
+def _cf_fetch_timeout(client: httpx.AsyncClient) -> int:
+    """Derive a sensible total timeout for curl_cffi direct fetches.
+
+    httpx.Timeout may expose read/connect attributes (floats); fall back to the
+    configured http timeout when those are unavailable.
+    """
+    configured = int((config.get("http") or {}).get("timeout_seconds", 20))
+    timeout = getattr(client, "timeout", None)
+    if timeout is None:
+        return configured
+    # Prefer the overall timeout bound if available, otherwise read, otherwise connect.
+    for attr in ("total", "read", "connect"):
+        value = getattr(timeout, attr, None)
+        if value is not None:
+            try:
+                seconds = float(value)
+                if seconds > 0:
+                    return int(seconds)
+            except Exception:
+                pass
+    return configured
 
 
 def cf_configured_cookies(monitor: dict[str, Any]) -> dict[str, str]:
@@ -2268,8 +2481,12 @@ def cf_cached_session(monitor: dict[str, Any]) -> dict[str, Any] | None:
         return None
     configured_cookies = cf_configured_cookies(monitor)
     if configured_cookies:
-        cached = {**cached, "cookies": {**configured_cookies, **cached["cookies"]}}
+        cached = {**cached, "cookies": {**cached["cookies"], **configured_cookies}}
     return cached
+
+
+def cookie_header(cookies: dict[str, str]) -> str:
+    return "; ".join(f"{key}={value}" for key, value in cookies.items() if key and value)
 
 
 def cf_impersonate_for_user_agent(user_agent: str) -> str:
@@ -2343,33 +2560,53 @@ def update_cf_cookie_cache(monitor: dict[str, Any], response: httpx.Response) ->
     }
 
 
-async def refresh_cf_cookie_cache(client: httpx.AsyncClient, monitor: dict[str, Any]) -> bool:
-    base_url = cf_bypass_base_url(monitor)
+async def refresh_cf_cookie_cache(client: httpx.AsyncClient, monitor: dict[str, Any], *, force: bool = False) -> bool:
+    base_url = _require_cf_bypass_base_url(monitor)
     target_url = str(monitor.get("url") or "").strip()
-    if not base_url or not target_url:
+    if not target_url:
         return False
     endpoint = f"{base_url}/cookies?{urlencode({'url': target_url})}"
-    try:
-        response = await client.get(endpoint, follow_redirects=True)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        logger.warning("cf cookie refresh failed monitor=%s error=%s", monitor.get("name"), e)
-        return False
-    cookies = data.get("cookies") if isinstance(data, dict) else None
-    user_agent = str(data.get("user_agent") or "").strip() if isinstance(data, dict) else ""
-    if not isinstance(cookies, dict) or not cookies or not user_agent:
-        logger.warning("cf cookie refresh returned incomplete data monitor=%s", monitor.get("name"))
-        return False
-    cf_cookie_cache[cf_cache_key(monitor)] = {
-        "cookies": {str(k): str(v) for k, v in cookies.items()},
-        "user_agent": user_agent,
-        "impersonate": cf_impersonate_for_user_agent(user_agent),
-        "expires_at": time.time() + cf_cache_ttl_seconds(monitor),
-    }
-    cf_names = [str(k) for k in cookies if str(k).startswith(("cf_", "__cf"))]
-    logger.info("cf cookie cache refreshed monitor=%s cookies=%s", monitor.get("name"), cf_names)
-    return True
+    cache_key = cf_cache_key(monitor)
+    lock = cf_cookie_refresh_locks.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        # Another task may have refreshed while we were waiting for the lock.
+        if not force and cf_cached_session(monitor) is not None:
+            logger.debug("cf cookie cache already populated while waiting monitor=%s", monitor.get("name"))
+            return True
+        try:
+            headers = {}
+            configured_cookies = cf_configured_cookies(monitor)
+            if configured_cookies:
+                headers["Cookie"] = cookie_header(configured_cookies)
+            if force:
+                timeout = cf_refresh_timeout_seconds(monitor)
+                async with httpx.AsyncClient(timeout=timeout, trust_env=False) as cf_client:
+                    clear_resp = await cf_client.post(f"{base_url}/cache/clear")
+                    clear_resp.raise_for_status()
+                    response = await cf_client.get(endpoint, headers=headers, follow_redirects=True)
+                    response.raise_for_status()
+                    data = response.json()
+            else:
+                response = await client.get(endpoint, headers=headers, follow_redirects=True)
+                response.raise_for_status()
+                data = response.json()
+        except Exception as e:
+            logger.warning("cf cookie refresh failed monitor=%s force=%s error=%s", monitor.get("name"), force, e)
+            return False
+        cookies = data.get("cookies") if isinstance(data, dict) else None
+        user_agent = str(data.get("user_agent") or "").strip() if isinstance(data, dict) else ""
+        if not isinstance(cookies, dict) or not cookies or not user_agent:
+            logger.warning("cf cookie refresh returned incomplete data monitor=%s", monitor.get("name"))
+            return False
+        cf_cookie_cache[cache_key] = {
+            "cookies": {str(k): str(v) for k, v in cookies.items()},
+            "user_agent": user_agent,
+            "impersonate": cf_impersonate_for_user_agent(user_agent),
+            "expires_at": time.time() + cf_cache_ttl_seconds(monitor),
+        }
+        cf_names = [str(k) for k in cookies if str(k).startswith(("cf_", "__cf"))]
+        logger.info("cf cookie cache refreshed monitor=%s force=%s cookies=%s", monitor.get("name"), force, cf_names)
+        return True
 
 
 async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | None:
@@ -2384,39 +2621,51 @@ async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | 
         "Accept-Language": "en-US,en;q=0.9",
     }
     proxy_url = cf_direct_proxy_url(monitor)
-    async with CurlAsyncSession(impersonate=impersonate, headers=headers, timeout=timeout) as session:
-        response = await session.get(str(monitor.get("url") or ""), cookies=cached["cookies"], proxy=proxy_url, allow_redirects=True)
-    body = response.text
-    if looks_like_cloudflare_challenge(int(response.status_code), body):
-        logger.info("cf cached direct fetch rejected monitor=%s status=%s, refreshing via bypass", monitor.get("name"), response.status_code)
+    target_url = str(monitor.get("url") or "").strip()
+    if not target_url:
+        return None
+    try:
+        async with CurlAsyncSession(impersonate=impersonate, headers=headers, timeout=timeout) as session:
+            response = await session.get(target_url, cookies=cached["cookies"], proxy=proxy_url, allow_redirects=True)
+        body = response.text
+        if looks_like_cloudflare_challenge(int(response.status_code), body):
+            logger.info("cf cached direct fetch rejected monitor=%s status=%s, refreshing via bypass", monitor.get("name"), response.status_code)
+            cf_cookie_cache.pop(cf_cache_key(monitor), None)
+            return None
+        response.raise_for_status()
+        logger.info("cf cached direct fetch ok monitor=%s status=%s impersonate=%s", monitor.get("name"), response.status_code, impersonate)
+        return body
+    except Exception as e:
+        logger.warning("cf direct fetch failed monitor=%s error=%s", monitor.get("name"), e)
         cf_cookie_cache.pop(cf_cache_key(monitor), None)
         return None
-    response.raise_for_status()
-    logger.info("cf cached direct fetch ok monitor=%s status=%s impersonate=%s", monitor.get("name"), response.status_code, impersonate)
-    return body
 
 
 async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | str) -> str:
     if isinstance(monitor_or_url, dict) and monitor_or_url.get("cf_bypass"):
-        timeout = safe_int(getattr(client.timeout, "connect", None), int((config.get("http") or {}).get("timeout_seconds", 20)))
-        direct_body = await fetch_with_cf_cookies(monitor_or_url, timeout)
+        monitor = monitor_or_url
+        _require_cf_bypass_base_url(monitor)
+        timeout = _cf_fetch_timeout(client)
+        direct_body = await fetch_with_cf_cookies(monitor, timeout)
         if direct_body is not None:
             return direct_body
-        if await refresh_cf_cookie_cache(client, monitor_or_url):
-            direct_body = await fetch_with_cf_cookies(monitor_or_url, timeout)
+        if await refresh_cf_cookie_cache(client, monitor):
+            direct_body = await fetch_with_cf_cookies(monitor, timeout)
             if direct_body is not None:
                 return direct_body
-        if cf_configured_cookies(monitor_or_url):
-            raise RuntimeError(f"cf logged-in fetch failed for monitor {monitor_or_url.get('name')}")
+        if await refresh_cf_cookie_cache(client, monitor, force=True):
+            direct_body = await fetch_with_cf_cookies(monitor, timeout)
+            if direct_body is not None:
+                return direct_body
+        raise RuntimeError(f"cf logged-in fetch failed for monitor {monitor.get('name')!r}")
     url = monitor_fetch_url(monitor_or_url) if isinstance(monitor_or_url, dict) else str(monitor_or_url)
-    resp = await client.get(url, follow_redirects=True)
+    headers = None
+    if isinstance(monitor_or_url, dict):
+        configured_cookies = cf_configured_cookies(monitor_or_url)
+        if configured_cookies:
+            headers = {"Cookie": cookie_header(configured_cookies)}
+    resp = await client.get(url, headers=headers, follow_redirects=True)
     resp.raise_for_status()
-    if isinstance(monitor_or_url, dict) and monitor_or_url.get("cf_bypass"):
-        update_cf_cookie_cache(monitor_or_url, resp)
-        timeout = safe_int(getattr(client.timeout, "connect", None), int((config.get("http") or {}).get("timeout_seconds", 20)))
-        direct_body = await fetch_with_cf_cookies(monitor_or_url, timeout)
-        if direct_body is not None:
-            return direct_body
     return resp.text
 
 
@@ -2429,6 +2678,18 @@ def normalize_json_body(body: str) -> str:
     if pre:
         text = pre.get_text("", strip=True)
     return html.unescape(text).strip()
+
+
+def linuxdo_welfare_has_login_state(body: str) -> bool:
+    payload = json.loads(normalize_json_body(body))
+    topic_list = payload.get("topic_list") if isinstance(payload, dict) else None
+    topics = topic_list.get("topics") if isinstance(topic_list, dict) else None
+    if not isinstance(topics, list) or not topics:
+        return False
+    for topic in topics:
+        if isinstance(topic, dict) and any(key in topic for key in LINUXDO_LOGIN_TOPIC_KEYS):
+            return True
+    return False
 
 
 def parse_web_items(monitor: dict[str, Any], body: str) -> list[MonitorItem]:
@@ -2719,12 +2980,19 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
     try:
         async with httpx.AsyncClient(timeout=timeout, headers=headers, trust_env=not bool(monitor.get("cf_bypass"))) as client:
             body = await fetch_url(client, monitor)
+        if is_linuxdo_welfare_monitor(monitor) and not linuxdo_welfare_has_login_state(body):
+            detail = "福利区返回缺少登录态字段，疑似 _t 已失效或未生效"
+            await maybe_send_monitor_login_alert(monitor, detail)
+            raise RuntimeError(detail)
         if mtype == "rss":
             items = parse_rss_items(monitor, body)
         elif mtype == "json":
             items = parse_json_items(monitor, body)
         else:
             items = parse_web_items(monitor, body)
+        alert_settings = monitor_failure_alert_settings(monitor)
+        if not items and alert_settings["empty_result_is_failure"]:
+            raise RuntimeError("monitor fetched successfully but parsed 0 items")
         for item in items:
             blocked, block_reason = item_blocked(item, monitor)
             if blocked:
@@ -2773,9 +3041,13 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
             if await admin_send_monitor(text, name):
                 sent_count += 1
         record_monitor_runtime(name, ok=True, duration_ms=int((time.time() - started) * 1000), sent_count=sent_count)
+        if is_linuxdo_welfare_monitor(monitor):
+            await maybe_send_monitor_login_recovery_alert(monitor)
+        await maybe_send_monitor_recovery_alert(monitor)
     except Exception as e:
         logger.exception("monitor failed: %s %s", name, url)
-        record_monitor_runtime(name, ok=False, duration_ms=int((time.time() - started) * 1000), sent_count=sent_count, error=str(e))
+        failures = record_monitor_runtime(name, ok=False, duration_ms=int((time.time() - started) * 1000), sent_count=sent_count, error=str(e))
+        await maybe_send_monitor_failure_alert(monitor, failures, str(e))
     return sent_count
 
 
@@ -2962,6 +3234,7 @@ def env_values() -> dict[str, str]:
     return {
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", ""),
         "ADMIN_CHAT_ID": os.getenv("ADMIN_CHAT_ID", ""),
+        "LINUXDO_COOKIE": os.getenv("LINUXDO_COOKIE", ""),
         "LOG_LEVEL": os.getenv("LOG_LEVEL", "INFO"),
         "WEB_PANEL_ENABLED": os.getenv("WEB_PANEL_ENABLED", "true"),
         "WEB_PANEL_HOST": os.getenv("WEB_PANEL_HOST", "127.0.0.1"),
@@ -2984,10 +3257,12 @@ def write_env_values(values: dict[str, str]) -> None:
                 key, value = line.split("=", 1)
                 existing[key.strip()] = value.strip()
     session_value = values.get("WEB_PANEL_SESSION_SECRET") or existing.get("WEB_PANEL_SESSION_SECRET", "")
+    linuxdo_cookie = normalize_cookie_value(values.get("LINUXDO_COOKIE") or existing.get("LINUXDO_COOKIE", ""), "_t")
     lines = [
         "# tg-watchbot environment",
         f"TELEGRAM_BOT_TOKEN={values.get('TELEGRAM_BOT_TOKEN','')}",
         f"ADMIN_CHAT_ID={values.get('ADMIN_CHAT_ID','')}",
+        f"LINUXDO_COOKIE={linuxdo_cookie}",
         f"LOG_LEVEL={values.get('LOG_LEVEL','INFO')}",
         "",
         "# Web 管理面板；默认只监听本机，建议用 SSH 隧道或反代再暴露",
@@ -3062,6 +3337,7 @@ def cfg_save(new_cfg: dict[str, Any]) -> None:
             safe_int(gm.get("ai_dedupe_window_seconds", DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS), DEFAULT_GROUP_AI_DEDUPE_WINDOW_SECONDS),
         )
     CONFIG_PATH.write_text(yaml.safe_dump(new_cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    apply_env_monitor_overrides(new_cfg)
     global config
     config = new_cfg
     reload_scheduler_jobs()
@@ -3203,6 +3479,15 @@ def monitor_from_form(
     if not m["name"] or not m["url"]:
         raise ValueError("名称和 URL 必填")
     return m
+
+
+def preserve_monitor_form_hidden_fields(new_monitor: dict[str, Any], old_monitor: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(old_monitor, dict):
+        return new_monitor
+    for key in PRESERVED_MONITOR_FORM_KEYS:
+        if key in old_monitor and key not in new_monitor:
+            new_monitor[key] = old_monitor[key]
+    return new_monitor
 
 
 def layout(title: str, body: str) -> str:
@@ -3753,7 +4038,13 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
     ) -> RedirectResponse:
         cfg = cfg_load_fresh()
         monitors = cfg.setdefault("monitors", [])
+        old_monitor = None
+        if original_index is not None:
+            if original_index < 0 or original_index >= len(monitors):
+                raise HTTPException(404, "monitor not found")
+            old_monitor = monitors[original_index]
         m = monitor_from_form(original_index, name, mtype, url, interval_seconds, keywords, item_selector, title_selector, link_selector, price_selector, stock_selector, bool(keyword_match), bool(new_item), bool(price_change), bool(stock_change), bool(notify_telegram))
+        m = preserve_monitor_form_hidden_fields(m, old_monitor)
         if original_index is None:
             monitors.append(m)
         else:
@@ -3869,6 +4160,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 </div>
 <div class=step><div class=step-title><span class=step-no>3</span><span>高级设置</span></div>
 <p class=muted>一般保持默认即可。</p>
+<label>Linux.do 福利区登录 Cookie（可选，留空则不带登录态）</label><textarea name=LINUXDO_COOKIE placeholder='_t=... 或直接填 _t 的值'>{html_escape(v.get('LINUXDO_COOKIE',''))}</textarea>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <h3>自动清理</h3><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
 </div>
@@ -3920,7 +4212,7 @@ async function logoutTgSession() {{
         cfg_save(cfg)
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LINUXDO_COOKIE: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
         return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 

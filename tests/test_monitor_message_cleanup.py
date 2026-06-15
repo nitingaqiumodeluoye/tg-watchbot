@@ -503,6 +503,55 @@ class MonitorRuntimeAndUpdateTest(unittest.TestCase):
         self.assertEqual(2, data["last_sent_count"])
         self.assertEqual(70, data["last_duration_ms"])
 
+    def test_monitor_failure_alert_sends_once_at_threshold(self) -> None:
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        old_config = app.config
+        fake_bot = FakeBot()
+        monitor = {"name": "m1", "url": "https://example.com"}
+        app.bot = fake_bot
+        app.admin_chat_ids = [1001]
+        app.config = {"monitoring": {"failure_alerts": {"enabled": True, "consecutive_failures": 2}}}
+        try:
+            app.record_monitor_runtime("m1", ok=False, duration_ms=10, sent_count=0, error="e1")
+            asyncio.run(app.maybe_send_monitor_failure_alert(monitor, 1, "e1"))
+            self.assertEqual([], fake_bot.sent_texts)
+
+            app.record_monitor_runtime("m1", ok=False, duration_ms=10, sent_count=0, error="e2")
+            asyncio.run(app.maybe_send_monitor_failure_alert(monitor, 2, "e2"))
+            asyncio.run(app.maybe_send_monitor_failure_alert(monitor, 3, "e3"))
+
+            self.assertEqual(1, len(fake_bot.sent_texts))
+            self.assertIn("[监控连续失败告警]", fake_bot.sent_texts[0])
+            self.assertIn("连续失败：2 次", fake_bot.sent_texts[0])
+        finally:
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+            app.config = old_config
+
+    def test_monitor_recovery_alert_clears_active_failure_alert(self) -> None:
+        old_bot = app.bot
+        old_admin_chat_ids = app.admin_chat_ids
+        old_config = app.config
+        fake_bot = FakeBot()
+        monitor = {"name": "m1", "url": "https://example.com"}
+        app.bot = fake_bot
+        app.admin_chat_ids = [1001]
+        app.config = {"monitoring": {"failure_alerts": {"enabled": True, "consecutive_failures": 2, "notify_recovery": True}}}
+        try:
+            app.set_monitor_failure_alert_state("m1", 2, "e2")
+            self.assertTrue(app.monitor_failure_alert_is_active("m1"))
+
+            asyncio.run(app.maybe_send_monitor_recovery_alert(monitor))
+
+            self.assertFalse(app.monitor_failure_alert_is_active("m1"))
+            self.assertEqual(1, len(fake_bot.sent_texts))
+            self.assertIn("[监控恢复]", fake_bot.sent_texts[0])
+        finally:
+            app.bot = old_bot
+            app.admin_chat_ids = old_admin_chat_ids
+            app.config = old_config
+
     def test_git_update_status_parses_ahead_behind_and_dirty(self) -> None:
         old_git_run = app.git_run
 
