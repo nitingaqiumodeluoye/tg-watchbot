@@ -75,6 +75,7 @@ CONFIG_PATH = BASE_DIR / "config.yaml"
 ENV_PATH = BASE_DIR / ".env"
 LOG_PATH = BASE_DIR / "tg-watchbot.log"
 LINUXDO_WELFARE_JSON_URL = "https://linux.do/c/welfare/36.json"
+LINUXDO_HOST = "linux.do"
 LINUXDO_LOGIN_TOPIC_KEYS = {
     "can_assign",
     "last_read_post_number",
@@ -181,6 +182,15 @@ def is_linuxdo_welfare_monitor(monitor: dict[str, Any] | None) -> bool:
     if not isinstance(monitor, dict):
         return False
     return str(monitor.get("url") or "").strip() == LINUXDO_WELFARE_JSON_URL
+
+
+def is_linuxdo_rss_monitor(monitor: dict[str, Any] | None) -> bool:
+    if not isinstance(monitor, dict):
+        return False
+    if str(monitor.get("type") or "").strip().lower() != "rss":
+        return False
+    url = str(monitor.get("url") or "").strip().lower()
+    return url.startswith(f"https://{LINUXDO_HOST}/") and url.endswith(".rss")
 
 
 def apply_env_monitor_overrides(cfg: dict[str, Any]) -> None:
@@ -2540,6 +2550,16 @@ def looks_like_cloudflare_challenge(status_code: int, body: str) -> bool:
     )
 
 
+def should_retry_monitor_via_cf_bypass(monitor: dict[str, Any], status_code: int, body: str) -> bool:
+    if bool(monitor.get("cf_bypass")):
+        return False
+    if not is_linuxdo_rss_monitor(monitor):
+        return False
+    if not cf_bypass_base_url(monitor):
+        return False
+    return looks_like_cloudflare_challenge(status_code, body)
+
+
 def update_cf_cookie_cache(monitor: dict[str, Any], response: httpx.Response) -> None:
     raw_cookies = response.headers.get("x-cf-bypasser-cookies-json", "").strip()
     user_agent = response.headers.get("x-cf-bypasser-user-agent", "").strip()
@@ -2617,7 +2637,7 @@ async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | 
     impersonate = str(cached.get("impersonate") or cf_impersonate_for_user_agent(user_agent))
     headers = {
         "User-Agent": user_agent,
-        "Accept": "application/json,text/plain,*/*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,text/plain;q=0.7,*/*;q=0.6",
         "Accept-Language": "en-US,en;q=0.9",
     }
     proxy_url = cf_direct_proxy_url(monitor)
@@ -2665,6 +2685,15 @@ async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | 
         if configured_cookies:
             headers = {"Cookie": cookie_header(configured_cookies)}
     resp = await client.get(url, headers=headers, follow_redirects=True)
+    if isinstance(monitor_or_url, dict):
+        body = resp.text
+        if should_retry_monitor_via_cf_bypass(monitor_or_url, int(resp.status_code), body):
+            logger.info(
+                "direct fetch challenged monitor=%s status=%s, retrying via cf bypass",
+                monitor_or_url.get("name"),
+                resp.status_code,
+            )
+            return await fetch_url(client, {**monitor_or_url, "cf_bypass": True})
     resp.raise_for_status()
     return resp.text
 

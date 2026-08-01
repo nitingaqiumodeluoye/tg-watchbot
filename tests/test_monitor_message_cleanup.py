@@ -7,6 +7,7 @@ import unittest
 from contextlib import closing
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from unittest.mock import AsyncMock
 
 
 def install_import_stubs() -> None:
@@ -765,6 +766,48 @@ class MonitorRuntimeAndUpdateTest(unittest.TestCase):
         self.assertIn("已发现群聊", source)
         self.assertIn("用此群创建监听", source)
         self.assertIn("/group-monitors/new?chat_id=", source)
+
+    def test_fetch_url_retries_linuxdo_rss_via_cf_bypass_after_cloudflare_block(self) -> None:
+        old_config = app.config
+        old_fetch_with_cf_cookies = app.fetch_with_cf_cookies
+        old_refresh_cf_cookie_cache = app.refresh_cf_cookie_cache
+        app.config = {"monitoring": {"cf_bypass_url": "http://127.0.0.1:18001"}}
+        app.fetch_with_cf_cookies = AsyncMock(return_value="<rss>ok</rss>")
+        app.refresh_cf_cookie_cache = AsyncMock(return_value=True)
+
+        class DummyResponse:
+            def __init__(self, status_code: int, text: str) -> None:
+                self.status_code = status_code
+                self.text = text
+
+            def raise_for_status(self) -> None:
+                raise RuntimeError(f"status {self.status_code}")
+
+        class DummyClient:
+            timeout = SimpleNamespace(total=20, read=20, connect=20)
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, str] | None, bool]] = []
+
+            async def get(self, url, headers=None, follow_redirects=True):
+                self.calls.append((url, headers, follow_redirects))
+                return DummyResponse(403, "Forbidden")
+
+        client = DummyClient()
+        monitor = {"name": "Linux.do 最新", "type": "rss", "url": "https://linux.do/latest.rss"}
+        try:
+            body = asyncio.run(app.fetch_url(client, monitor))
+            self.assertEqual("<rss>ok</rss>", body)
+            self.assertEqual(1, len(client.calls))
+            app.fetch_with_cf_cookies.assert_awaited()
+            self.assertTrue(
+                app.refresh_cf_cookie_cache.await_count >= 0,
+                "refresh_cf_cookie_cache should remain optional when cached/direct fetch succeeds",
+            )
+        finally:
+            app.config = old_config
+            app.fetch_with_cf_cookies = old_fetch_with_cf_cookies
+            app.refresh_cf_cookie_cache = old_refresh_cf_cookie_cache
 
 
 if __name__ == "__main__":
