@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote_plus, urlencode, urljoin
+from urllib.parse import quote, quote_plus, unquote, urlencode, urljoin
 import os.path as ospath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -164,14 +164,41 @@ def load_config() -> dict[str, Any]:
     return data
 
 
+def encode_cookie_value(value: str) -> str:
+    """把单个 Cookie 值规整成百分号编码形式。
+
+    Rack/Discourse 收到 Cookie 后会先做一次百分号解码，因此 `+` 必须写成 %2B，
+    否则会被解成空格，导致 base64 里带 `+` 的 _t 直接失效。
+    这里先 unquote 再 quote，保证「原始值」和「已编码值」两种粘贴方式
+    都能得到同一个正确结果（幂等）。
+    """
+    decoded = unquote(str(value or ""))
+    # safe 中刻意不含 "+" 与 "%"
+    return quote(decoded, safe="!#$&'()*,-./:<>?@[]^_`{|}~=")
+
+
+COOKIE_NAME_RE = re.compile(r"[A-Za-z0-9_.\-]{1,32}")
+
+
 def normalize_cookie_value(value: Any, default_name: str = "_t") -> str:
     raw = str(value or "").strip()
     if not raw:
         return ""
     first = raw.split(";", 1)[0].strip()
-    if "=" not in first:
-        return f"{default_name}={raw}"
-    return raw
+    name, sep, _ = first.partition("=")
+    # 靠“名字形状”区分两种输入：合法 Cookie 名总是很短（如 _t），
+    # 而裸 token 即使含 "=" （base64 填充）其首个 "=" 前也会很长，
+    # 因此不会被误判成已经带 "名字=" 的 Cookie 头。
+    if not (sep and COOKIE_NAME_RE.fullmatch(name.strip())):
+        return f"{default_name}={encode_cookie_value(raw)}"
+    pairs: list[str] = []
+    for part in raw.split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        item_name, item_sep, item_val = part.partition("=")
+        pairs.append(f"{item_name.strip()}={encode_cookie_value(item_val)}" if item_sep else part)
+    return "; ".join(pairs)
 
 
 def linuxdo_cookie_value() -> str:
@@ -3010,7 +3037,7 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
         async with httpx.AsyncClient(timeout=timeout, headers=headers, trust_env=not bool(monitor.get("cf_bypass"))) as client:
             body = await fetch_url(client, monitor)
         if is_linuxdo_welfare_monitor(monitor) and not linuxdo_welfare_has_login_state(body):
-            detail = "福利区返回缺少登录态字段，疑似 _t 已失效或未生效"
+            detail = "福利区返回缺少登录态字段，疑似 _t 已失效或未生效（可在面板「设置」页更新 LINUXDO_COOKIE，保存后即时生效）"
             await maybe_send_monitor_login_alert(monitor, detail)
             raise RuntimeError(detail)
         if mtype == "rss":
@@ -3310,6 +3337,22 @@ def write_env_values(values: dict[str, str]) -> None:
     ENV_PATH.write_text("\n".join(lines), encoding="utf-8")
     ENV_PATH.chmod(0o600)
     load_dotenv(ENV_PATH, override=True)
+    refresh_config_after_env_change()
+
+
+def refresh_config_after_env_change() -> None:
+    """env 变更后重建配置并重排监控任务。
+
+    LINUXDO_COOKIE 是通过 apply_env_monitor_overrides() 注入到 monitor 字典里的，
+    而已注册的 APScheduler 任务持有的是旧的 monitor 字典副本，所以必须重新
+    load_config() 再重排任务，新 Cookie 才会立即生效，无需重启容器。
+    """
+    global config
+    try:
+        config = load_config()
+    except Exception as e:
+        logger.warning("reload config after env change failed: %s", e)
+    reload_scheduler_jobs()
 
 
 def cfg_load_fresh() -> dict[str, Any]:
@@ -4243,7 +4286,7 @@ async function logoutTgSession() {{
     @app.post("/settings", response_class=HTMLResponse)
     async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LINUXDO_COOKIE: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
         save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
-        return layout("已保存", "<div class=msg>已保存，不会自动重启；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
+        return layout("已保存", "<div class=msg>已保存并已重载监控任务（Cookie 类配置即时生效）；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
 
     @app.get("/send", response_class=HTMLResponse)
