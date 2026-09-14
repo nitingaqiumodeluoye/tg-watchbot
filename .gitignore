@@ -12,3 +12,6 @@ venv/
 .pytest_cache/
 .ruff_cache/
 .DS_Store
+
+# logrotate 轮转产物
+tg-watchbot.log.*
