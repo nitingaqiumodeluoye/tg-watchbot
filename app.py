@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import quote, quote_plus, unquote, urlencode, urljoin
+from urllib.parse import quote, quote_plus, unquote, urlencode, urljoin, urlparse
 import os.path as ospath
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -116,6 +116,8 @@ PRESERVED_MONITOR_FORM_KEYS = {
     "cf_cookie_ttl_seconds",
     "cf_cookies",
     "cf_direct_proxy_url",
+    "cf_warmup_url",
+    "cf_warmup_cookie_names",
     "exclude_keywords",
     "failure_alert_threshold",
     "failure_alerts_enabled",
@@ -143,6 +145,12 @@ telegram_qr_logins: dict[str, dict[str, Any]] = {}
 GROUP_SUMMARY_MAX_CHARS = 800
 cf_cookie_cache: dict[str, dict[str, Any]] = {}
 cf_cookie_refresh_locks: dict[str, asyncio.Lock] = {}
+# Cloudflare sometimes challenges the curl_cffi direct fetch even with a freshly
+# minted cf_clearance, because it dislikes the request fingerprint / egress IP
+# rather than the cookie. These track how often that happened per monitor so the
+# direct path can be paused in favour of the browser mirror.
+cf_direct_failures: dict[str, int] = {}
+cf_direct_block_until: dict[str, float] = {}
 DEFAULT_CF_DIRECT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
 
 
@@ -2454,16 +2462,121 @@ def monitor_fetch_url(monitor: dict[str, Any]) -> str:
     return f"{base_url}/html?{urlencode({'url': url})}"
 
 
+def cf_warmup_url(monitor: dict[str, Any]) -> str:
+    """URL used to warm up Cloudflare clearance cookies via the bypass service.
+
+    Cloudflare only issues ``cf_clearance`` when it actually challenges the
+    browser. Some paths (e.g. Discourse ``.json`` endpoints) are served to the
+    browser without ever triggering a challenge, so warming up on the monitored
+    URL itself never yields a clearance cookie. Pointing this at a regular HTML
+    page of the same origin makes the challenge happen and the issued clearance
+    is valid domain-wide for the direct (curl_cffi) fetch.
+    """
+    warmup = str(monitor.get("cf_warmup_url") or "").strip()
+    if warmup:
+        return warmup
+    target = str(monitor.get("url") or "").strip()
+    if not target or not bool(monitor.get("cf_bypass")):
+        return target
+    # Fall back to the origin root: an HTML page is far more likely to trigger a
+    # Cloudflare challenge than a JSON/RSS endpoint.
+    parsed = urlparse(target)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}/"
+    return target
+
+
+def cf_warmup_cookie_names(monitor: dict[str, Any]) -> set[str]:
+    """Cookie names that must be present for a warmed-up session to be useful."""
+    raw = monitor.get("cf_warmup_cookie_names")
+    if isinstance(raw, str):
+        names = {part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()}
+    elif isinstance(raw, (list, tuple, set)):
+        names = {str(item).strip() for item in raw if str(item).strip()}
+    else:
+        names = set()
+    if not names:
+        names = {"cf_clearance"}
+    return names
+
+
+def cf_warmup_satisfied(monitor: dict[str, Any], cookies: dict[str, str]) -> bool:
+    """Whether a warmed-up cookie jar contains the cookies we care about."""
+    names = cf_warmup_cookie_names(monitor)
+    if not names:
+        return bool(cookies)
+    return any(name in cookies for name in names)
+
+
 def cf_cache_key(monitor: dict[str, Any]) -> str:
     return hashlib.sha256(str(monitor.get("url") or "").encode("utf-8", errors="ignore")).hexdigest()
 
 
 def cf_cache_ttl_seconds(monitor: dict[str, Any]) -> int:
-    return max(60, safe_int(monitor.get("cf_cookie_ttl_seconds"), 90 * 60))
+    """TTL for the in-memory cf session cache, in seconds.
+
+    ``0`` (the default) means the cached session is kept until the direct fetch
+    proves it dead (a Cloudflare challenge or 4xx/5xx), at which point it is
+    dropped and re-warmed. Set ``cf_cookie_ttl_seconds`` to a positive value to
+    restore periodic re-warming.
+    """
+    return max(0, safe_int(monitor.get("cf_cookie_ttl_seconds"), 0))
 
 
 def cf_refresh_timeout_seconds(monitor: dict[str, Any]) -> int:
     return max(30, safe_int(monitor.get("cf_refresh_timeout_seconds"), 150))
+
+
+def cf_direct_failure_limit() -> int:
+    """Consecutive direct-fetch rejections before mirror-only mode kicks in."""
+    return max(1, safe_int(os.getenv("CF_DIRECT_FAILURE_LIMIT"), 2))
+
+
+def cf_direct_block_seconds() -> int:
+    """How long mirror-only mode lasts after the direct path proves hopeless."""
+    return max(0, safe_int(os.getenv("CF_DIRECT_BLOCK_SECONDS"), 1800))
+
+
+def cf_direct_blocked_seconds(monitor: dict[str, Any]) -> float:
+    """Remaining mirror-only seconds (0 when the direct path is allowed)."""
+    remaining = cf_direct_block_until.get(cf_cache_key(monitor), 0.0) - time.time()
+    return remaining if remaining > 0 else 0.0
+
+
+def record_cf_direct_rejection(monitor: dict[str, Any]) -> None:
+    """Count a Cloudflare rejection of the direct fetch, pausing it once hopeless.
+
+    When the direct fetch is challenged right after a warmup, the cached
+    cf_clearance is not what Cloudflare objects to: it is challenging the
+    curl_cffi request fingerprint (or the egress IP). Every further direct
+    attempt costs another 30-90s warmup before the browser mirror runs anyway,
+    so after ``CF_DIRECT_FAILURE_LIMIT`` consecutive rejections the direct path
+    is skipped for ``CF_DIRECT_BLOCK_SECONDS`` in favour of the mirror.
+    """
+    key = cf_cache_key(monitor)
+    failures = cf_direct_failures.get(key, 0) + 1
+    cf_direct_failures[key] = failures
+    if failures < cf_direct_failure_limit():
+        return
+    seconds = cf_direct_block_seconds()
+    if seconds <= 0:
+        return
+    cf_direct_block_until[key] = time.time() + seconds
+    logger.warning(
+        "cf direct fetch paused monitor=%s rejections=%s pause_seconds=%s reason=clearance_ignored",
+        monitor.get("name"), failures, seconds,
+    )
+
+
+def record_cf_direct_success(monitor: dict[str, Any]) -> None:
+    """Reset the rejection counter and leave mirror-only mode."""
+    key = cf_cache_key(monitor)
+    # Pop both explicitly: `a.pop() or b.pop()` would short-circuit and leave the
+    # pause in place whenever the failure counter is non-empty.
+    failures = cf_direct_failures.pop(key, None)
+    paused = cf_direct_block_until.pop(key, None)
+    if failures or paused:
+        logger.info("cf direct fetch recovered monitor=%s", monitor.get("name"))
 
 
 def _cf_fetch_timeout(client: httpx.AsyncClient) -> int:
@@ -2511,7 +2624,9 @@ def cf_cached_session(monitor: dict[str, Any]) -> dict[str, Any] | None:
     cached = cf_cookie_cache.get(cf_cache_key(monitor))
     if not cached:
         return None
-    if time.time() >= float(cached.get("expires_at", 0)):
+    expires_at = cached.get("expires_at")
+    # expires_at is None when the session is kept until proven dead.
+    if expires_at is not None and time.time() >= float(expires_at):
         cf_cookie_cache.pop(cf_cache_key(monitor), None)
         return None
     if not cached.get("cookies") or not cached.get("user_agent"):
@@ -2587,6 +2702,13 @@ def should_retry_monitor_via_cf_bypass(monitor: dict[str, Any], status_code: int
     return looks_like_cloudflare_challenge(status_code, body)
 
 
+def cf_session_expires_at(monitor: dict[str, Any]) -> float | None:
+    """Timestamp when the cached session should be re-warmed, or None to keep it
+    until a fetch proves it dead."""
+    ttl = cf_cache_ttl_seconds(monitor)
+    return time.time() + ttl if ttl > 0 else None
+
+
 def update_cf_cookie_cache(monitor: dict[str, Any], response: httpx.Response) -> None:
     raw_cookies = response.headers.get("x-cf-bypasser-cookies-json", "").strip()
     user_agent = response.headers.get("x-cf-bypasser-user-agent", "").strip()
@@ -2603,16 +2725,25 @@ def update_cf_cookie_cache(monitor: dict[str, Any], response: httpx.Response) ->
         "cookies": {str(k): str(v) for k, v in cookies.items()},
         "user_agent": user_agent,
         "impersonate": cf_impersonate_for_user_agent(user_agent),
-        "expires_at": time.time() + cf_cache_ttl_seconds(monitor),
+        "expires_at": cf_session_expires_at(monitor),
     }
 
 
 async def refresh_cf_cookie_cache(client: httpx.AsyncClient, monitor: dict[str, Any], *, force: bool = False) -> bool:
+    """Warm up the cf_bypass cookie jar for ``monitor``.
+
+    ``client`` is accepted for call-site compatibility but is intentionally not
+    reused: the bypass browser may have to solve a real Cloudflare challenge
+    (typically 30-90s), so requests go through a dedicated client using
+    ``cf_refresh_timeout_seconds`` instead of the short monitor timeout.
+    """
     base_url = _require_cf_bypass_base_url(monitor)
     target_url = str(monitor.get("url") or "").strip()
     if not target_url:
         return False
-    endpoint = f"{base_url}/cookies?{urlencode({'url': target_url})}"
+    # Warm up on an HTML page so Cloudflare actually issues cf_clearance;
+    # the clearance is valid for the whole origin, including the monitored URL.
+    warmup_url = cf_warmup_url(monitor)
     cache_key = cf_cache_key(monitor)
     lock = cf_cookie_refresh_locks.setdefault(cache_key, asyncio.Lock())
     async with lock:
@@ -2620,26 +2751,84 @@ async def refresh_cf_cookie_cache(client: httpx.AsyncClient, monitor: dict[str, 
         if not force and cf_cached_session(monitor) is not None:
             logger.debug("cf cookie cache already populated while waiting monitor=%s", monitor.get("name"))
             return True
-        try:
-            headers = {}
-            configured_cookies = cf_configured_cookies(monitor)
-            if configured_cookies:
-                headers["Cookie"] = cookie_header(configured_cookies)
+        headers = {}
+        configured_cookies = cf_configured_cookies(monitor)
+        if configured_cookies:
+            headers["Cookie"] = cookie_header(configured_cookies)
+
+        async def request_session(url: str, *, force: bool = False) -> dict[str, Any] | None:
+            params = {"url": url}
             if force:
+                # Tell the bypass service to drop the cached session, otherwise it
+                # would hand back the very clearance we just found to be dead.
+                params["force"] = "true"
+            endpoint = f"{base_url}/cookies?{urlencode(params)}"
+            # Never reuse the monitor's short-lived client here: warming up an HTML
+            # page makes the bypass browser solve a real challenge, which routinely
+            # takes 30-90s and would always trip the 20s monitor timeout.
+            timeout = cf_refresh_timeout_seconds(monitor)
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as cf_client:
+                response = await cf_client.get(endpoint, headers=headers, follow_redirects=True)
+                response.raise_for_status()
+                return response.json()
+
+        if force:
+            # Invalidate only this hostname on the bypass side (once, before any
+            # attempt) so a warmup result is not wiped by the fallback attempt and
+            # other monitors keep their healthy sessions.
+            try:
                 timeout = cf_refresh_timeout_seconds(monitor)
                 async with httpx.AsyncClient(timeout=timeout, trust_env=False) as cf_client:
-                    clear_resp = await cf_client.post(f"{base_url}/cache/clear")
-                    clear_resp.raise_for_status()
-                    response = await cf_client.get(endpoint, headers=headers, follow_redirects=True)
-                    response.raise_for_status()
-                    data = response.json()
-            else:
-                response = await client.get(endpoint, headers=headers, follow_redirects=True)
-                response.raise_for_status()
-                data = response.json()
-        except Exception as e:
-            logger.warning("cf cookie refresh failed monitor=%s force=%s error=%s", monitor.get("name"), force, e)
-            return False
+                    invalidate_resp = await cf_client.post(
+                        f"{base_url}/cache/invalidate?{urlencode({'url': warmup_url or target_url})}"
+                    )
+                    invalidate_resp.raise_for_status()
+            except Exception as e:
+                logger.warning("cf cache invalidate failed monitor=%s error=%s", monitor.get("name"), e)
+
+        attempt_urls: list[str] = []
+        for candidate in (warmup_url, target_url):
+            if candidate and candidate not in attempt_urls:
+                attempt_urls.append(candidate)
+
+        data: dict[str, Any] | None = None
+        fallback: dict[str, Any] | None = None
+        required = cf_warmup_cookie_names(monitor)
+        for attempt_url in attempt_urls:
+            try:
+                candidate_data = await request_session(attempt_url, force=force and attempt_url == warmup_url)
+            except Exception as e:
+                logger.warning(
+                    "cf cookie refresh failed monitor=%s force=%s url=%s error=%s",
+                    monitor.get("name"), force, attempt_url, e,
+                )
+                continue
+            candidate_cookies = candidate_data.get("cookies") if isinstance(candidate_data, dict) else None
+            if not isinstance(candidate_cookies, dict) or not candidate_cookies:
+                continue
+            normalized = {str(k): str(v) for k, v in candidate_cookies.items()}
+            if cf_warmup_satisfied(monitor, normalized):
+                data = candidate_data
+                if attempt_url != target_url:
+                    logger.info(
+                        "cf warmup ok monitor=%s warmup_url=%s cookies=%s",
+                        monitor.get("name"), attempt_url, sorted(normalized),
+                    )
+                break
+            # Keep the monitored URL's own session as the fallback: it is the
+            # most faithful match for the upcoming direct fetch.
+            if attempt_url == target_url:
+                fallback = candidate_data
+            elif fallback is None:
+                fallback = candidate_data
+            logger.info(
+                "cf warmup incomplete monitor=%s url=%s missing=%s cookies=%s",
+                monitor.get("name"), attempt_url,
+                sorted(required - set(normalized)), sorted(normalized),
+            )
+
+        if data is None:
+            data = fallback
         cookies = data.get("cookies") if isinstance(data, dict) else None
         user_agent = str(data.get("user_agent") or "").strip() if isinstance(data, dict) else ""
         if not isinstance(cookies, dict) or not cookies or not user_agent:
@@ -2649,7 +2838,7 @@ async def refresh_cf_cookie_cache(client: httpx.AsyncClient, monitor: dict[str, 
             "cookies": {str(k): str(v) for k, v in cookies.items()},
             "user_agent": user_agent,
             "impersonate": cf_impersonate_for_user_agent(user_agent),
-            "expires_at": time.time() + cf_cache_ttl_seconds(monitor),
+            "expires_at": cf_session_expires_at(monitor),
         }
         cf_names = [str(k) for k in cookies if str(k).startswith(("cf_", "__cf"))]
         logger.info("cf cookie cache refreshed monitor=%s force=%s cookies=%s", monitor.get("name"), force, cf_names)
@@ -2678,9 +2867,11 @@ async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | 
         if looks_like_cloudflare_challenge(int(response.status_code), body):
             logger.info("cf cached direct fetch rejected monitor=%s status=%s, refreshing via bypass", monitor.get("name"), response.status_code)
             cf_cookie_cache.pop(cf_cache_key(monitor), None)
+            record_cf_direct_rejection(monitor)
             return None
         response.raise_for_status()
         logger.info("cf cached direct fetch ok monitor=%s status=%s impersonate=%s", monitor.get("name"), response.status_code, impersonate)
+        record_cf_direct_success(monitor)
         return body
     except Exception as e:
         logger.warning("cf direct fetch failed monitor=%s error=%s", monitor.get("name"), e)
@@ -2688,11 +2879,57 @@ async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | 
         return None
 
 
+async def fetch_via_cf_html(client: httpx.AsyncClient, monitor: dict[str, Any]) -> str | None:
+    """Last-resort cf_bypass fetch: let the bypass browser load the page itself.
+
+    Used when the cookie-cache direct fetch keeps getting challenged (cf_clearance
+    unavailable). The configured cf_cookies (e.g. the linux.do _t login cookie)
+    are forwarded so the bypass browser session stays logged in; a JSON target is
+    returned as <pre>-wrapped text that normalize_json_body already handles.
+    """
+    base_url = _require_cf_bypass_base_url(monitor)
+    target_url = str(monitor.get("url") or "").strip()
+    if not target_url:
+        return None
+    endpoint = f"{base_url}/html?{urlencode({'url': target_url})}"
+    configured_cookies = cf_configured_cookies(monitor)
+    headers = {"Cookie": cookie_header(configured_cookies)} if configured_cookies else {}
+    timeout = cf_refresh_timeout_seconds(monitor)
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as html_client:
+            response = await html_client.get(endpoint, headers=headers, follow_redirects=True)
+            response.raise_for_status()
+            body = response.text
+    except Exception as e:
+        logger.warning("cf html fallback failed monitor=%s error=%s", monitor.get("name"), e)
+        return None
+    if not body or not body.strip():
+        return None
+    if looks_like_cloudflare_challenge(200, body):
+        logger.info("cf html fallback still challenged monitor=%s", monitor.get("name"))
+        return None
+    logger.info("cf html fallback ok monitor=%s chars=%s", monitor.get("name"), len(body))
+    return body
+
+
 async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | str) -> str:
     if isinstance(monitor_or_url, dict) and monitor_or_url.get("cf_bypass"):
         monitor = monitor_or_url
         _require_cf_bypass_base_url(monitor)
         timeout = _cf_fetch_timeout(client)
+        paused_for = cf_direct_blocked_seconds(monitor)
+        if paused_for > 0:
+            # Consecutive Cloudflare rejections already proved that a fresh
+            # clearance does not make the direct fetch work, so skip the direct
+            # path and its 30-90s warmups: let the bypass browser load it.
+            logger.info(
+                "cf mirror mode monitor=%s direct_paused_for=%ss",
+                monitor.get("name"), int(paused_for),
+            )
+            html_body = await fetch_via_cf_html(client, monitor)
+            if html_body is not None:
+                return html_body
+            logger.warning("cf mirror fetch failed monitor=%s, retrying cookie path", monitor.get("name"))
         direct_body = await fetch_with_cf_cookies(monitor, timeout)
         if direct_body is not None:
             return direct_body
@@ -2704,6 +2941,9 @@ async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | 
             direct_body = await fetch_with_cf_cookies(monitor, timeout)
             if direct_body is not None:
                 return direct_body
+        html_body = await fetch_via_cf_html(client, monitor)
+        if html_body is not None:
+            return html_body
         raise RuntimeError(f"cf logged-in fetch failed for monitor {monitor.get('name')!r}")
     url = monitor_fetch_url(monitor_or_url) if isinstance(monitor_or_url, dict) else str(monitor_or_url)
     headers = None
