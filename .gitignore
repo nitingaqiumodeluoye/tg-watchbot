@@ -15,3 +15,9 @@ venv/
 
 # logrotate 轮转产物
 tg-watchbot.log.*
+
+# 本地工具与备份产物
+.rtk/
+CLAUDE.md
+*.bak
+*.bak-*

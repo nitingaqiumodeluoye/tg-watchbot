@@ -85,6 +85,17 @@ LINUXDO_LOGIN_TOPIC_KEYS = {
     "unread_posts",
 }
 
+# curl_cffi impersonation matching the TLS/HTTP2 fingerprint of the browser the
+# bypass service uses (camoufox). Cloudflare binds cf_clearance to the fingerprint
+# that solved the challenge, and camoufox reports a randomised User-Agent
+# (Firefox/140, /141, /143...) while actually being built on a much newer Firefox,
+# so deriving the impersonation from that UA picks firefox144 -- which Cloudflare
+# rejects with `cf-mitigated: challenge`. Measured 2026-09-19 against
+# https://linux.do/c/welfare/36.json: firefox133 returned 200 with a complete
+# login state 8/8 times, while firefox135/144/147 and the chrome profiles returned
+# 403 6/6 times. Override per monitor with `cf_impersonate: <name>` in config.yaml.
+CAMOUFOX_IMPERSONATE = "firefox133"
+
 
 def telegram_proxy_url() -> str | None:
     for key in ("TELEGRAM_PROXY_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
@@ -2662,6 +2673,26 @@ def cf_impersonate_for_user_agent(user_agent: str) -> str:
     return "firefox"
 
 
+def cf_impersonate_candidates(monitor: dict[str, Any], user_agent: str) -> list[str]:
+    """Ordered curl_cffi impersonations to try for a bypass-issued session.
+
+    Only the bypass browser can obtain cf_clearance, and Cloudflare validates that
+    clearance against the client fingerprint, so the impersonation must match the
+    browser rather than the User-Agent it happens to report. The known-good
+    camoufox fingerprint is tried first, then the UA-derived guess; a per-monitor
+    ``cf_impersonate`` wins over both.
+    """
+    candidates: list[str] = []
+    for value in (
+        str(monitor.get("cf_impersonate") or "").strip(),
+        CAMOUFOX_IMPERSONATE,
+        cf_impersonate_for_user_agent(user_agent),
+    ):
+        if value and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
 def cf_direct_proxy_url(monitor: dict[str, Any]) -> str | None:
     value = str(monitor.get("cf_direct_proxy_url") or "").strip()
     if value.lower() in {"", "none", "false", "off", "0"}:
@@ -2850,33 +2881,59 @@ async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | 
     if not cached:
         return None
     user_agent = str(cached["user_agent"])
-    impersonate = str(cached.get("impersonate") or cf_impersonate_for_user_agent(user_agent))
+    target_url = str(monitor.get("url") or "").strip()
+    if not target_url:
+        return None
+    proxy_url = cf_direct_proxy_url(monitor)
     headers = {
         "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,text/plain;q=0.7,*/*;q=0.6",
         "Accept-Language": "en-US,en;q=0.9",
     }
-    proxy_url = cf_direct_proxy_url(monitor)
-    target_url = str(monitor.get("url") or "").strip()
-    if not target_url:
-        return None
-    try:
-        async with CurlAsyncSession(impersonate=impersonate, headers=headers, timeout=timeout) as session:
-            response = await session.get(target_url, cookies=cached["cookies"], proxy=proxy_url, allow_redirects=True)
-        body = response.text
-        if looks_like_cloudflare_challenge(int(response.status_code), body):
-            logger.info("cf cached direct fetch rejected monitor=%s status=%s, refreshing via bypass", monitor.get("name"), response.status_code)
-            cf_cookie_cache.pop(cf_cache_key(monitor), None)
-            record_cf_direct_rejection(monitor)
-            return None
-        response.raise_for_status()
-        logger.info("cf cached direct fetch ok monitor=%s status=%s impersonate=%s", monitor.get("name"), response.status_code, impersonate)
-        record_cf_direct_success(monitor)
-        return body
-    except Exception as e:
-        logger.warning("cf direct fetch failed monitor=%s error=%s", monitor.get("name"), e)
-        cf_cookie_cache.pop(cf_cache_key(monitor), None)
-        return None
+    # Try fingerprints in order: a cached session remembers the one that worked
+    # last time, so the steady state is a single request.
+    candidates = cf_impersonate_candidates(monitor, user_agent)
+    remembered = str(cached.get("impersonate") or "").strip()
+    if remembered in candidates:
+        candidates.remove(remembered)
+        candidates.insert(0, remembered)
+
+    last_status: int | None = None
+    for impersonate in candidates:
+        try:
+            async with CurlAsyncSession(impersonate=impersonate, headers=headers, timeout=timeout) as session:
+                response = await session.get(target_url, cookies=cached["cookies"], proxy=proxy_url, allow_redirects=True)
+            body = response.text
+            if looks_like_cloudflare_challenge(int(response.status_code), body):
+                last_status = int(response.status_code)
+                logger.info(
+                    "cf direct fetch challenged monitor=%s impersonate=%s status=%s, trying next fingerprint",
+                    monitor.get("name"), impersonate, last_status,
+                )
+                continue
+            response.raise_for_status()
+            logger.info(
+                "cf cached direct fetch ok monitor=%s status=%s impersonate=%s",
+                monitor.get("name"), response.status_code, impersonate,
+            )
+            entry = cf_cookie_cache.get(cf_cache_key(monitor))
+            if isinstance(entry, dict):
+                entry["impersonate"] = impersonate
+            record_cf_direct_success(monitor)
+            return body
+        except Exception as e:
+            logger.warning(
+                "cf direct fetch failed monitor=%s impersonate=%s error=%s",
+                monitor.get("name"), impersonate, e,
+            )
+            continue
+    logger.info(
+        "cf cached direct fetch rejected monitor=%s status=%s impersonates=%s, refreshing via bypass",
+        monitor.get("name"), last_status, candidates,
+    )
+    cf_cookie_cache.pop(cf_cache_key(monitor), None)
+    record_cf_direct_rejection(monitor)
+    return None
 
 
 async def fetch_via_cf_html(client: httpx.AsyncClient, monitor: dict[str, Any]) -> str | None:
