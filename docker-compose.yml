@@ -24,3 +24,4 @@ services:
       - ./config.yaml:/app/config.yaml
       - ./tg-watchbot.sqlite3:/app/tg-watchbot.sqlite3
       - ./tg-watchbot.log:/app/tg-watchbot.log
+      - ./cdk_session.json:/app/cdk_session.json

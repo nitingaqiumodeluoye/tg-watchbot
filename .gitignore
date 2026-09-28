@@ -21,3 +21,7 @@ tg-watchbot.log.*
 CLAUDE.md
 *.bak
 *.bak-*
+
+# CDK 领取会话凭据（含 linux_do_cdk_session_id，严禁提交）
+cdk_session.json
+cdk_session*.json
