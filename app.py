@@ -127,8 +127,13 @@ PRESERVED_MONITOR_FORM_KEYS = {
     "cf_cookie_ttl_seconds",
     "cf_cookies",
     "cf_direct_proxy_url",
+    "cf_impersonate",
     "cf_warmup_url",
     "cf_warmup_cookie_names",
+    "cdk_alert",
+    "cdk_claim",
+    "fetch_body",
+    "fetch_body_max_chars",
     "exclude_keywords",
     "failure_alert_threshold",
     "failure_alerts_enabled",
@@ -409,6 +414,29 @@ def init_db() -> None:
                 consecutive_failures INTEGER DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
+            -- Every CDK claim attempt is persisted, including the redeemed code.
+            -- Telegram delivery is best-effort, so the code must survive a send
+            -- failure: the row is the record of truth, `notified` only tracks
+            -- whether the follow-up message actually reached the admin.
+            CREATE TABLE IF NOT EXISTS cdk_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT NOT NULL,
+                project_name TEXT,
+                link TEXT,
+                monitor_name TEXT,
+                ok INTEGER DEFAULT 0,
+                reason TEXT,
+                detail TEXT,
+                content TEXT,
+                already_received INTEGER DEFAULT 0,
+                dry_run INTEGER DEFAULT 0,
+                elapsed_ms INTEGER DEFAULT 0,
+                attempts INTEGER DEFAULT 0,
+                notified INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS cdk_claims_created_idx ON cdk_claims(created_at);
+            CREATE INDEX IF NOT EXISTS cdk_claims_notified_idx ON cdk_claims(notified);
             CREATE TABLE IF NOT EXISTS group_monitor_recent (
                 monitor_name TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
@@ -2413,6 +2441,11 @@ class MonitorItem:
     author: str | None = None
     published: str | None = None
     category: str | None = None
+    body: str | None = None
+    # Give-away links found in the *untruncated* body. Kept beside ``body``
+    # because ``body`` gets clipped to fetch_body_max_chars for Telegram, and a
+    # CDK link sitting past that cut would otherwise silently disappear.
+    cdk_links: list[str] | None = None
 
 
 def stable_key(*parts: str) -> str:
@@ -2520,7 +2553,11 @@ def cf_warmup_satisfied(monitor: dict[str, Any], cookies: dict[str, str]) -> boo
 
 
 def cf_cache_key(monitor: dict[str, Any]) -> str:
-    return hashlib.sha256(str(monitor.get("url") or "").encode("utf-8", errors="ignore")).hexdigest()
+    # ``cf_cache_key_url`` lets a derived monitor (e.g. the per-topic /raw fetch)
+    # share the warmed session of the monitor it was derived from instead of each
+    # topic warming up its own browser session.
+    source = str(monitor.get("cf_cache_key_url") or monitor.get("url") or "")
+    return hashlib.sha256(source.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def cf_cache_ttl_seconds(monitor: dict[str, Any]) -> int:
@@ -2546,6 +2583,23 @@ def cf_direct_failure_limit() -> int:
 def cf_direct_block_seconds() -> int:
     """How long mirror-only mode lasts after the direct path proves hopeless."""
     return max(0, safe_int(os.getenv("CF_DIRECT_BLOCK_SECONDS"), 1800))
+
+
+def cf_direct_retry_count() -> int:
+    """Extra attempts with the *same* clearance before declaring it dead.
+
+    A 403/429 is not proof that cf_clearance expired: Cloudflare returns the
+    same status for per-IP rate limiting and transient WAF decisions, and the
+    clearance keeps working right after those pass. Retrying with the cached
+    session costs ~0.4s, whereas a force warmup costs 43-72s of headless
+    browser time and feeds the very rate limiting that caused the 403.
+    """
+    return max(0, safe_int(os.getenv("CF_DIRECT_RETRY_COUNT"), 2))
+
+
+def cf_direct_retry_delay_seconds() -> float:
+    """Pause between same-clearance retries, in seconds."""
+    return max(0.0, safe_float(os.getenv("CF_DIRECT_RETRY_DELAY_SECONDS"), 2.0))
 
 
 def cf_direct_blocked_seconds(monitor: dict[str, Any]) -> float:
@@ -2653,6 +2707,13 @@ def cookie_header(cookies: dict[str, str]) -> str:
 
 
 def cf_impersonate_for_user_agent(user_agent: str) -> str:
+    """Derive a curl_cffi impersonation from a User-Agent string.
+
+    Only used as a *last* fallback. It is deliberately NOT what gets remembered
+    for a warmed session: camoufox randomises the version it reports (Firefox/141,
+    /142, /143 ...) while actually being a different build, so this maps to
+    firefox147 / firefox144 and Cloudflare rejects it. See CAMOUFOX_IMPERSONATE.
+    """
     ua = (user_agent or "").lower()
     if "firefox" in ua:
         match = re.search(r"firefox/(\d+)", ua)
@@ -2693,6 +2754,20 @@ def cf_impersonate_candidates(monitor: dict[str, Any], user_agent: str) -> list[
     return candidates
 
 
+# Impersonations actually expected to pass Cloudflare for the camoufox sessions
+# this service hands out. `remembered` is only trusted when it is in here, so a
+# UA-derived guess can never pin the direct path to a rejected fingerprint (which
+# used to burn two rejections per warmup and lock a monitor into mirror-only mode
+# for 30 minutes at a time).
+KNOWN_GOOD_IMPERSONATES = (CAMOUFOX_IMPERSONATE,)
+
+
+def cf_remembered_impersonate(cached: dict[str, Any]) -> str:
+    """The cached impersonation, but only if it is one we still trust."""
+    remembered = str(cached.get("impersonate") or "").strip()
+    return remembered if remembered in KNOWN_GOOD_IMPERSONATES else ""
+
+
 def cf_direct_proxy_url(monitor: dict[str, Any]) -> str | None:
     value = str(monitor.get("cf_direct_proxy_url") or "").strip()
     if value.lower() in {"", "none", "false", "off", "0"}:
@@ -2706,31 +2781,118 @@ def cf_direct_proxy_url(monitor: dict[str, Any]) -> str | None:
     return None
 
 
-def looks_like_cloudflare_challenge(status_code: int, body: str) -> bool:
-    if status_code in {403, 429, 521, 522, 523}:
-        return True
-    text = (body or "")[:12000].lower()
-    return any(
-        marker in text
-        for marker in (
-            "just a moment",
-            "cf-turnstile",
-            "cf_chl",
-            "cloudflare challenge",
-            "enable javascript and cookies",
-            "cf-mitigated",
-        )
+# Cloudflare challenge page fingerprints. These only appear on an interstitial
+# ("Just a moment..."), never in a normal Discourse JSON/HTML payload.
+CF_CHALLENGE_BODY_MARKERS = (
+    "just a moment",
+    "cf-turnstile",
+    "cf_chl",
+    "_cf_chl_opt",
+    "challenge-platform",
+    "cloudflare challenge",
+    "enable javascript and cookies",
+    "cf-please-wait",
+    "attention required",
+)
+# Bot-management / rate-limit blocks: served as a finished error page, not an
+# interstitial. These do NOT clear up by retrying and are not fixed by a new
+# cf_clearance either, so they deserve the expensive fallback immediately.
+CF_HARD_BLOCK_BODY_MARKERS = (
+    "error 1020",
+    "access denied",
+    "you have been blocked",
+    "cf-error-details",
+    "error 1015",
+)
+CF_ORIGIN_ERROR_STATUS = {521, 522, 523, 524, 525, 526}
+
+
+def cf_challenge_reason(status_code: int, body: str, headers: Any = None) -> str:
+    """Classify a Cloudflare rejection using headers *and* body, not just status.
+
+    Returns one of:
+      ""            not a Cloudflare rejection at all
+      "challenge"   an interstitial; the same clearance often works on retry
+      "blocked"     a hard bot-management/rate-limit page; retrying is futile
+      "origin"      Cloudflare got a bad response from the origin
+      "status"      status-only signal (no body/header evidence available)
+
+    The distinction matters because a bare 403 previously forced the caller to
+    discard a healthy ``cf_clearance`` and pay 43-72s for a headless browser
+    challenge. Measured 2026-09-27 against ``/c/welfare/36.json``: one valid
+    clearance returned 403/403/403/200/403/200 across six identical back-to-back
+    requests, i.e. Cloudflare rejects *individual requests* probabilistically
+    even while the clearance is perfectly good.
+    """
+    header_map = {}
+    if headers is not None:
+        try:
+            header_map = {str(k).lower(): str(v) for k, v in dict(headers).items()}
+        except Exception:
+            header_map = {}
+
+    # ``cf-mitigated: challenge`` is Cloudflare's own machine-readable marker for
+    # "this is an interstitial, solve the challenge again".
+    mitigated = header_map.get("cf-mitigated", "").strip().lower()
+    if mitigated in {"challenge", "challenge_solved"}:
+        return "challenge"
+
+    text = (body or "")[:20000].lower()
+    if any(marker in text for marker in CF_HARD_BLOCK_BODY_MARKERS):
+        return "blocked"
+
+    is_cf = (
+        "cloudflare" in header_map.get("server", "").lower()
+        or "cloudflare" in header_map.get("cf-ray", "").lower()
+        or header_map.get("cf-ray") is not None
+        or any(marker in text for marker in CF_CHALLENGE_BODY_MARKERS)
     )
+    if any(marker in text for marker in CF_CHALLENGE_BODY_MARKERS):
+        return "challenge"
+
+    if status_code in {429, 503}:
+        # Rate limiting: keeps the same clearance, retry with backoff.
+        return "blocked" if header_map.get("retry-after") else "challenge"
+    if status_code in CF_ORIGIN_ERROR_STATUS:
+        return "origin"
+    if status_code in {401, 403}:
+        # 401/403 with no challenge markers is an application-level denial
+        # (bad/expired login cookie), not something a new clearance fixes.
+        return "blocked" if is_cf else "status"
+    if status_code in {521, 522, 523}:
+        return "origin"
+    return ""
 
 
-def should_retry_monitor_via_cf_bypass(monitor: dict[str, Any], status_code: int, body: str) -> bool:
+def looks_like_cloudflare_challenge(status_code: int, body: str, headers: Any = None) -> bool:
+    """True when the response is a Cloudflare interstitial (or hard block).
+
+    Origin errors (521/522/523) are deliberately excluded: they are a server-side
+    fault, not a bot check, and must not be reported as a challenge.
+    """
+    return cf_challenge_reason(status_code, body, headers) not in {"", "origin"}
+
+
+def cf_warrants_new_clearance(reason: str) -> bool:
+    """Whether this outcome justifies warming up / discarding the cached clearance.
+
+    ``no_session`` (nothing has been warmed up yet, e.g. right after a restart)
+    does warrant a warmup -- there is no cached clearance to retry with. A
+    *challenge* may be fixed by a fresh clearance. A hard block or an origin
+    error is not, and an application-level 403 means the login cookie is stale,
+    which a new ``cf_clearance`` cannot repair either.
+    """
+    return reason in {"challenge", "no_session"}
+
+
+def should_retry_monitor_via_cf_bypass(monitor: dict[str, Any], status_code: int, body: str, headers: Any = None) -> bool:
     if bool(monitor.get("cf_bypass")):
         return False
     if not is_linuxdo_rss_monitor(monitor):
         return False
     if not cf_bypass_base_url(monitor):
         return False
-    return looks_like_cloudflare_challenge(status_code, body)
+    return looks_like_cloudflare_challenge(status_code, body, headers)
 
 
 def cf_session_expires_at(monitor: dict[str, Any]) -> float | None:
@@ -2755,7 +2917,8 @@ def update_cf_cookie_cache(monitor: dict[str, Any], response: httpx.Response) ->
     cf_cookie_cache[cf_cache_key(monitor)] = {
         "cookies": {str(k): str(v) for k, v in cookies.items()},
         "user_agent": user_agent,
-        "impersonate": cf_impersonate_for_user_agent(user_agent),
+        # Remember the fingerprint known to pass, never the UA-derived guess.
+        "impersonate": CAMOUFOX_IMPERSONATE,
         "expires_at": cf_session_expires_at(monitor),
     }
 
@@ -2865,25 +3028,77 @@ async def refresh_cf_cookie_cache(client: httpx.AsyncClient, monitor: dict[str, 
         if not isinstance(cookies, dict) or not cookies or not user_agent:
             logger.warning("cf cookie refresh returned incomplete data monitor=%s", monitor.get("name"))
             return False
+        normalized = {str(k): str(v) for k, v in cookies.items()}
+        # The bypass service hands back whatever session it currently holds, and
+        # that session may have no cf_clearance at all (observed 2026-09-27:
+        # cookies=['_cfuvid', '_t']). Caching that would make every later direct
+        # fetch fail until something forced a real challenge, so treat a session
+        # missing the required cookies as a failed warmup and let the caller
+        # escalate to force=True.
+        if not cf_warmup_satisfied(monitor, normalized):
+            logger.warning(
+                "cf warmup unusable monitor=%s force=%s missing=%s cookies=%s",
+                monitor.get("name"), force, sorted(required - set(normalized)), sorted(normalized),
+            )
+            cf_cookie_cache.pop(cache_key, None)
+            return False
         cf_cookie_cache[cache_key] = {
-            "cookies": {str(k): str(v) for k, v in cookies.items()},
+            "cookies": normalized,
             "user_agent": user_agent,
-            "impersonate": cf_impersonate_for_user_agent(user_agent),
+            # Remember the fingerprint known to pass, never the UA-derived guess.
+            "impersonate": CAMOUFOX_IMPERSONATE,
             "expires_at": cf_session_expires_at(monitor),
         }
-        cf_names = [str(k) for k in cookies if str(k).startswith(("cf_", "__cf"))]
+        cf_names = [str(k) for k in normalized if str(k).startswith(("cf_", "__cf"))]
         logger.info("cf cookie cache refreshed monitor=%s force=%s cookies=%s", monitor.get("name"), force, cf_names)
         return True
 
 
-async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | None:
+@dataclass
+class CfDirectResult:
+    """Outcome of a direct curl_cffi fetch attempt.
+
+    The rejection *reason* travels with the result instead of being stashed in
+    ``cf_cookie_cache``: that cache is keyed per monitor URL, but several
+    monitors share one warmed session, so a global "last_reason" leaked across
+    them and reported an unrelated monitor's cause.
+    """
+    body: str | None = None
+    reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.body is not None
+
+
+async def fetch_with_cf_cookies(
+    monitor: dict[str, Any],
+    timeout: int,
+    *,
+    count_rejection: bool = True,
+    drop_cache_on_failure: bool = True,
+) -> CfDirectResult:
+    """Direct curl_cffi fetch using a cached cf session.
+
+    ``count_rejection=False`` is used for the retries inside a single
+    ``fetch_url`` call: one logical fetch can burn through several fingerprints
+    and both warmup stages, and counting each as an independent rejection used
+    to trip the ``CF_DIRECT_FAILURE_LIMIT`` pause *before* the ``force=True``
+    warmup (the only one that actually mints a fresh session) ever ran, leaving
+    the monitor stuck in mirror-only mode. Only the final outcome of a fetch
+    should count.
+
+    ``drop_cache_on_failure=False`` keeps the cached session so a transient
+    rate-limit 403 can be retried with the same clearance instead of throwing
+    away a perfectly good one and paying for a fresh browser challenge.
+    """
     cached = cf_cached_session(monitor)
     if not cached:
-        return None
+        return CfDirectResult(None, "no_session")
     user_agent = str(cached["user_agent"])
     target_url = str(monitor.get("url") or "").strip()
     if not target_url:
-        return None
+        return CfDirectResult(None, "no_url")
     proxy_url = cf_direct_proxy_url(monitor)
     headers = {
         "User-Agent": user_agent,
@@ -2893,22 +3108,25 @@ async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | 
     # Try fingerprints in order: a cached session remembers the one that worked
     # last time, so the steady state is a single request.
     candidates = cf_impersonate_candidates(monitor, user_agent)
-    remembered = str(cached.get("impersonate") or "").strip()
+    remembered = cf_remembered_impersonate(cached)
     if remembered in candidates:
         candidates.remove(remembered)
         candidates.insert(0, remembered)
 
     last_status: int | None = None
+    last_reason: str = ""
     for impersonate in candidates:
         try:
             async with CurlAsyncSession(impersonate=impersonate, headers=headers, timeout=timeout) as session:
                 response = await session.get(target_url, cookies=cached["cookies"], proxy=proxy_url, allow_redirects=True)
             body = response.text
-            if looks_like_cloudflare_challenge(int(response.status_code), body):
+            reason = cf_challenge_reason(int(response.status_code), body, response.headers)
+            if reason:
                 last_status = int(response.status_code)
+                last_reason = reason
                 logger.info(
-                    "cf direct fetch challenged monitor=%s impersonate=%s status=%s, trying next fingerprint",
-                    monitor.get("name"), impersonate, last_status,
+                    "cf direct fetch challenged monitor=%s impersonate=%s status=%s reason=%s, trying next fingerprint",
+                    monitor.get("name"), impersonate, last_status, reason,
                 )
                 continue
             response.raise_for_status()
@@ -2920,20 +3138,25 @@ async def fetch_with_cf_cookies(monitor: dict[str, Any], timeout: int) -> str | 
             if isinstance(entry, dict):
                 entry["impersonate"] = impersonate
             record_cf_direct_success(monitor)
-            return body
+            return CfDirectResult(body, "")
         except Exception as e:
             logger.warning(
                 "cf direct fetch failed monitor=%s impersonate=%s error=%s",
                 monitor.get("name"), impersonate, e,
             )
             continue
+    entry = cf_cookie_cache.get(cf_cache_key(monitor))
+    if isinstance(entry, dict):
+        entry.pop("last_reason", None)
     logger.info(
-        "cf cached direct fetch rejected monitor=%s status=%s impersonates=%s, refreshing via bypass",
-        monitor.get("name"), last_status, candidates,
+        "cf cached direct fetch rejected monitor=%s status=%s reason=%s impersonates=%s drop_cache=%s",
+        monitor.get("name"), last_status, last_reason or "unknown", candidates, drop_cache_on_failure,
     )
-    cf_cookie_cache.pop(cf_cache_key(monitor), None)
-    record_cf_direct_rejection(monitor)
-    return None
+    if drop_cache_on_failure:
+        cf_cookie_cache.pop(cf_cache_key(monitor), None)
+    if count_rejection:
+        record_cf_direct_rejection(monitor)
+    return CfDirectResult(None, last_reason or "unknown")
 
 
 async def fetch_via_cf_html(client: httpx.AsyncClient, monitor: dict[str, Any]) -> str | None:
@@ -2962,8 +3185,9 @@ async def fetch_via_cf_html(client: httpx.AsyncClient, monitor: dict[str, Any]) 
         return None
     if not body or not body.strip():
         return None
-    if looks_like_cloudflare_challenge(200, body):
-        logger.info("cf html fallback still challenged monitor=%s", monitor.get("name"))
+    html_reason = cf_challenge_reason(200, body)
+    if html_reason:
+        logger.info("cf html fallback still challenged monitor=%s reason=%s", monitor.get("name"), html_reason)
         return None
     logger.info("cf html fallback ok monitor=%s chars=%s", monitor.get("name"), len(body))
     return body
@@ -2987,20 +3211,75 @@ async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | 
             if html_body is not None:
                 return html_body
             logger.warning("cf mirror fetch failed monitor=%s, retrying cookie path", monitor.get("name"))
-        direct_body = await fetch_with_cf_cookies(monitor, timeout)
-        if direct_body is not None:
-            return direct_body
-        if await refresh_cf_cookie_cache(client, monitor):
-            direct_body = await fetch_with_cf_cookies(monitor, timeout)
-            if direct_body is not None:
-                return direct_body
-        if await refresh_cf_cookie_cache(client, monitor, force=True):
-            direct_body = await fetch_with_cf_cookies(monitor, timeout)
-            if direct_body is not None:
-                return direct_body
+        # A 403/429 does not prove the clearance is dead: Cloudflare serves the
+        # same status for short-lived per-IP rate limiting, and the very same
+        # session succeeds seconds later. Retry with the cached session first
+        # (~0.4s) instead of immediately paying 43-72s for a headless browser
+        # challenge, which also aggravates the rate limiting that caused it.
+        direct_result = await fetch_with_cf_cookies(
+            monitor, timeout, count_rejection=False, drop_cache_on_failure=False
+        )
+        if direct_result.ok:
+            return direct_result.body
+        reason = direct_result.reason
+        # ``blocked`` (bot-management / rate-limit page) and ``origin`` (bad
+        # upstream response) cannot be fixed by a fresh cf_clearance, so the
+        # 43-72s browser challenge is skipped entirely for those.
+        if cf_warrants_new_clearance(reason):
+            # Retrying only makes sense when there is a cached clearance to retry
+            # with; ``no_session`` means the cache is empty (fresh start).
+            if reason != "no_session":
+                retries = cf_direct_retry_count()
+                retry_delay = cf_direct_retry_delay_seconds()
+                for attempt in range(1, retries + 1):
+                    if retry_delay:
+                        await asyncio.sleep(retry_delay)
+                    logger.info(
+                        "cf direct fetch retry monitor=%s attempt=%s/%s reason=%s with cached clearance",
+                        monitor.get("name"), attempt, retries, reason,
+                    )
+                    retry_result = await fetch_with_cf_cookies(
+                        monitor, timeout, count_rejection=False, drop_cache_on_failure=False
+                    )
+                    if retry_result.ok:
+                        logger.info(
+                            "cf direct fetch recovered on retry monitor=%s attempt=%s",
+                            monitor.get("name"), attempt,
+                        )
+                        return retry_result.body
+                    reason = retry_result.reason
+                    if reason == "no_session":
+                        break
+        else:
+            logger.info(
+                "cf direct fetch skipped warmup monitor=%s reason=%s (a new clearance cannot fix this)",
+                monitor.get("name"), reason or "unknown",
+            )
+        # The cached clearance is genuinely not working. Drop it and mint a new
+        # session; the bypass service must forget its copy too, otherwise the
+        # non-force warmup would hand back the clearance we just proved dead.
+        # With no cached session there is nothing to invalidate, so the plain
+        # warmup is enough and avoids an extra browser-teardown round trip.
+        cf_cookie_cache.pop(cf_cache_key(monitor), None)
+        if cf_warrants_new_clearance(reason):
+            force_warm = reason != "no_session"
+            warmed = await refresh_cf_cookie_cache(client, monitor, force=force_warm)
+            if not warmed and not force_warm:
+                # The bypass service was holding a session without a usable
+                # cf_clearance. Force a real browser challenge instead.
+                logger.info("cf warmup unusable monitor=%s, forcing a fresh challenge", monitor.get("name"))
+                warmed = await refresh_cf_cookie_cache(client, monitor, force=True)
+            if warmed:
+                direct_result = await fetch_with_cf_cookies(monitor, timeout, count_rejection=False)
+                if direct_result.ok:
+                    record_cf_direct_success(monitor)
+                    return direct_result.body
         html_body = await fetch_via_cf_html(client, monitor)
         if html_body is not None:
             return html_body
+        # Exactly one rejection per failed logical fetch, recorded only after
+        # every stage (including the force=True warmup) has been exhausted.
+        record_cf_direct_rejection(monitor)
         raise RuntimeError(f"cf logged-in fetch failed for monitor {monitor.get('name')!r}")
     url = monitor_fetch_url(monitor_or_url) if isinstance(monitor_or_url, dict) else str(monitor_or_url)
     headers = None
@@ -3011,15 +3290,430 @@ async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | 
     resp = await client.get(url, headers=headers, follow_redirects=True)
     if isinstance(monitor_or_url, dict):
         body = resp.text
-        if should_retry_monitor_via_cf_bypass(monitor_or_url, int(resp.status_code), body):
+        if should_retry_monitor_via_cf_bypass(monitor_or_url, int(resp.status_code), body, resp.headers):
             logger.info(
-                "direct fetch challenged monitor=%s status=%s, retrying via cf bypass",
+                "direct fetch challenged monitor=%s status=%s reason=%s, retrying via cf bypass",
                 monitor_or_url.get("name"),
                 resp.status_code,
+                cf_challenge_reason(int(resp.status_code), body, resp.headers),
             )
             return await fetch_url(client, {**monitor_or_url, "cf_bypass": True})
     resp.raise_for_status()
     return resp.text
+
+
+LINUXDO_TOPIC_ID_RE = re.compile(r"(?:/t/(?:[^/]+/)?|/raw/|/topic/)(\d+)")
+
+# Give-away links look like https://cdk.linux.do/receive/<random-uuid>. The regex
+# is deliberately loose: it accepts any path under the host, so a new path shape
+# (/redeem/, a short code, extra query string) still matches. It also matches
+# inside markdown link syntax, because `[text](URL)` and `<URL>` both contain the
+# URL verbatim -- no markdown parsing needed.
+CDK_ALERT_HOST = "cdk.linux.do"
+CDK_LINK_RE = re.compile(
+    r"https?://(?:[a-z0-9-]+\.)*"
+    + CDK_ALERT_HOST.replace(".", r"\.")
+    + r"/[^\s<>\"'`)\]}\u3000-\u303f\uff00-\uffef]+",
+    re.I,
+)
+CDK_LINK_TRAILING_CHARS = ".,;:!?)]}>\"'`、。，；：！？）】》"
+
+
+def extract_cdk_links(text: str) -> list[str]:
+    """Return the give-away links found in a post body, in order, de-duplicated."""
+    found: list[str] = []
+    for match in CDK_LINK_RE.finditer(text or ""):
+        url = match.group(0).rstrip(CDK_LINK_TRAILING_CHARS)
+        if url and url not in found:
+            found.append(url)
+    return found
+
+
+def cdk_alert_enabled(monitor: dict[str, Any]) -> bool:
+    return bool(monitor.get("cdk_alert", False))
+
+
+def cdk_claim_enabled_for(monitor: dict[str, Any]) -> bool:
+    """Whether a monitor should auto-claim the CDK links it finds.
+
+    Two switches must agree: the monitor opts in with ``cdk_alert: true`` (it
+    already finds the links) plus ``cdk_claim: true``, and the process enables
+    claiming globally with ``CDK_CLAIM_ENABLED=1``. The global switch exists so
+    the feature can be turned off without editing config.yaml, and so a fresh
+    deploy never starts spending captcha credit before an operator says so.
+    """
+    if not bool(monitor.get("cdk_claim", False)):
+        return False
+    try:
+        import cdk_claim as _cdk_claim
+    except Exception as e:  # pragma: no cover - missing module must not break monitors
+        logger.warning("cdk claim module unavailable: %s", e)
+        return False
+    return _cdk_claim.cdk_claim_enabled()
+
+
+def linuxdo_topic_id(item_key: str, link: str = "") -> str:
+    """Extract a Discourse topic id from a monitor item key or link."""
+    key = str(item_key or "").strip()
+    if key.isdigit():
+        return key
+    for value in (key, link):
+        m = LINUXDO_TOPIC_ID_RE.search(value or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+def fetch_topic_body_settings(monitor: dict[str, Any]) -> dict[str, Any]:
+    return {
+        # ``cdk_alert`` needs the body to find the link, so it turns body
+        # fetching on by itself. Otherwise enabling the alert without enabling
+        # fetch_body would silently do nothing.
+        "enabled": bool(monitor.get("fetch_body", False)) or cdk_alert_enabled(monitor),
+        "max_chars": max(0, safe_int(monitor.get("fetch_body_max_chars"), 3000)),
+    }
+
+
+def strip_raw_body(raw: str, max_chars: int = 0) -> str:
+    """Collapse a Discourse /raw response into plain text for Telegram.
+
+    The cf_bypass /html fallback wraps the raw markdown in an HTML page with a
+    <pre> block, so unwrap that first. ``/raw/{id}`` itself returns markdown for
+    the *whole* topic (every reply), with ``---`` separated headers. The
+    notification only needs the first post, so keep everything before the first
+    separator and drop the leading ``username | timestamp | #1`` line.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if text.lstrip().startswith("<"):
+        if "<!DOCTYPE" in text[:200] or "Page Not Found" in text[:2000]:
+            return ""
+        soup = BeautifulSoup(text, "html.parser")
+        pre = soup.find("pre")
+        text = (pre.get_text("", strip=True) if pre else soup.get_text("\n", strip=True))
+        text = html.unescape(text).strip()
+    if not text:
+        return ""
+    for sep in ("\n-------------------------\n",):
+        head, found, _ = text.partition(sep)
+        if found:
+            text = head
+            break
+    lines = text.splitlines()
+    if lines and re.match(r"^[^|]{1,60}\|\s*\d{4}-\d\d-\d\d", lines[0]):
+        lines = lines[1:]
+    text = "\n".join(lines).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "…"
+    return text
+
+
+# Give-away links being worked on, so a re-scan of the same post never starts a
+# second claim (the monitor re-reads its list every interval and would otherwise
+# duplicate the work while the first claim is still polling captcha).
+cdk_claims_in_flight: set[str] = set()
+cdk_claims_done: dict[str, float] = {}
+CDK_CLAIM_DONE_TTL_SECONDS = 3600.0
+
+
+def _cdk_claim_key(project_id: str) -> str:
+    return str(project_id or "").strip().lower()
+
+
+def record_cdk_claim(
+    *,
+    project_id: str,
+    project_name: str,
+    link: str,
+    monitor_name: str,
+    ok: bool,
+    reason: str,
+    detail: str,
+    content: str,
+    already_received: bool,
+    dry_run: bool,
+    elapsed_ms: int,
+    attempts: int,
+) -> int:
+    """Persist one claim outcome (and its code) so a failed send cannot lose it.
+
+    Returns the row id, or 0 when the write failed -- persistence is a safety
+    net, never a reason to abort a claim that has already succeeded.
+    """
+    try:
+        with closing(db()) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO cdk_claims(
+                    project_id, project_name, link, monitor_name, ok, reason, detail,
+                    content, already_received, dry_run, elapsed_ms, attempts,
+                    notified, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+                """,
+                (
+                    project_id, project_name, link, monitor_name,
+                    1 if ok else 0, reason, detail[:600], content,
+                    1 if already_received else 0, 1 if dry_run else 0,
+                    int(elapsed_ms), int(attempts), now_iso(),
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+    except Exception as e:
+        logger.warning("cdk claim persist failed project=%s: %s", project_id, e)
+        return 0
+
+
+def mark_cdk_claim_notified(row_id: int) -> None:
+    if not row_id:
+        return
+    try:
+        with closing(db()) as conn:
+            conn.execute("UPDATE cdk_claims SET notified=1 WHERE id=?", (int(row_id),))
+            conn.commit()
+    except Exception as e:
+        logger.warning("cdk claim notify-flag failed id=%s: %s", row_id, e)
+
+
+def recent_cdk_claims(limit: int = 20) -> list[sqlite3.Row]:
+    with closing(db()) as conn:
+        return list(
+            conn.execute(
+                "SELECT * FROM cdk_claims ORDER BY id DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+        )
+
+
+def unsent_cdk_claims(limit: int = 20) -> list[sqlite3.Row]:
+    """Successful claims holding a code whose follow-up message never went out."""
+    with closing(db()) as conn:
+        return list(
+            conn.execute(
+                """
+                SELECT * FROM cdk_claims
+                WHERE ok=1 AND notified=0 AND content IS NOT NULL AND content != ''
+                ORDER BY id ASC LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        )
+
+
+def _cdk_claim_text_from_row(row: sqlite3.Row, *, recovered: bool = False) -> str:
+    title = row["project_name"] or row["project_id"]
+    label = "已领取过（此前领过）" if row["already_received"] else "领取成功"
+    head = "【CDK 自动领取·补发】" if recovered else "【CDK 自动领取】"
+    return (
+        f"{head}{html_escape(row['monitor_name'] or '')}\n"
+        f"项目：{html_escape(title)}\n"
+        f"结果：🏆 {label}\n"
+        f"CDK：\n<code>{html_escape(row['content'])}</code>\n"
+        f"领取时间：{html_escape(row['created_at'] or '-')}"
+    )
+
+
+async def flush_unsent_cdk_claims() -> int:
+    """Re-deliver claim results whose Telegram follow-up never arrived.
+
+    Without this a send failure during an outage would silently swallow the
+    redeemed code, which is the one thing that cannot be regenerated.
+    """
+    if not bot or not all_admin_chat_ids():
+        return 0
+    rows = unsent_cdk_claims(20)
+    if not rows:
+        return 0
+    logger.info("flushing unsent cdk claims: %d", len(rows))
+    sent = 0
+    for row in rows:
+        try:
+            if await admin_send_monitor(_cdk_claim_text_from_row(row, recovered=True), "CDK 补发"):
+                mark_cdk_claim_notified(int(row["id"]))
+                sent += 1
+        except Exception as e:
+            logger.warning("cdk claim flush failed id=%s: %s", row["id"], e)
+    return sent
+
+
+def schedule_cdk_claim(monitor: dict[str, Any], links: list[str]) -> bool:
+    """Dispatch a background claim task for the first not-yet-attempted link.
+
+    Called before the notification is sent, and independently of whether it
+    succeeds: the claim must not be lost to a Telegram failure or a muted
+    monitor. The claim itself (captcha + POST /receive) runs as its own task and
+    reports separately. Returns True when a task was dispatched.
+    """
+    if not links or not cdk_claim_enabled_for(monitor):
+        return False
+    try:
+        import cdk_claim as _cdk_claim
+    except Exception as e:
+        logger.warning("cdk claim import failed: %s", e)
+        return False
+
+    now = time.time()
+    for project_id, ts in list(cdk_claims_done.items()):
+        if now - ts > CDK_CLAIM_DONE_TTL_SECONDS:
+            cdk_claims_done.pop(project_id, None)
+
+    for link in links:
+        project_id = _cdk_claim.project_id_from_link(link)
+        key = _cdk_claim_key(project_id)
+        if not key:
+            continue
+        if key in cdk_claims_in_flight or key in cdk_claims_done:
+            continue
+        cdk_claims_in_flight.add(key)
+        asyncio.create_task(
+            _run_cdk_claim(monitor, link, project_id, key),
+            name=f"cdk-claim:{key}",
+        )
+        return True
+    return False
+
+
+async def _run_cdk_claim(
+    monitor: dict[str, Any], link: str, project_id: str, key: str
+) -> None:
+    """Claim one link in the background and report the outcome to Telegram."""
+    try:
+        import cdk_claim as _cdk_claim
+    except Exception as e:
+        logger.warning("cdk claim import failed: %s", e)
+        cdk_claims_in_flight.discard(key)
+        return
+
+    name = str(monitor.get("name") or "")
+    dry_run = _cdk_claim.cdk_claim_dry_run()
+    started = time.time()
+    try:
+        result = await asyncio.to_thread(_cdk_claim.claim_link, link, dry_run=dry_run)
+    except Exception as e:
+        logger.exception("cdk claim crashed monitor=%s project=%s: %s", name, project_id, e)
+        cdk_claims_in_flight.discard(key)
+        cdk_claims_done[key] = time.time()
+        await admin_send_monitor(
+            f"⚠️ CDK 自动领取异常\n项目：{html_escape(project_id)}\n"
+            f"错误：{html_escape(str(e)[:200])}",
+            name,
+        )
+        return
+    finally:
+        cdk_claims_in_flight.discard(key)
+
+    cdk_claims_done[key] = time.time()
+    elapsed = time.time() - started
+    logger.info(
+        "cdk claim finished monitor=%s project=%s ok=%s reason=%s dry_run=%s elapsed=%.1fs error=%s",
+        name, project_id, result.ok, result.reason, dry_run, elapsed, (result.error or "")[:120],
+    )
+    # Persist before notifying: the redeemed code must be on disk even if the
+    # message below never makes it out of the process.
+    row_id = record_cdk_claim(
+        project_id=project_id,
+        project_name=result.project_name or "",
+        link=link,
+        monitor_name=name,
+        ok=bool(result.ok),
+        reason=result.reason or "",
+        detail=result.error or "",
+        content=result.content or "",
+        already_received=bool(result.already_received),
+        dry_run=bool(dry_run),
+        elapsed_ms=int(result.elapsed_ms or elapsed * 1000),
+        attempts=int(result.attempts or 0),
+    )
+
+    title = result.project_name or project_id
+    head = f"【CDK 自动领取】{html_escape(name)}"
+    if result.ok and result.content:
+        label = "已领取过（此前领过）" if result.already_received else "领取成功"
+        text = (
+            f"{head}\n"
+            f"项目：{html_escape(title)}\n"
+            f"结果：🏆 {label}\n"
+            f"CDK：\n<code>{html_escape(result.content)}</code>\n"
+            f"耗时：{elapsed:.1f}s"
+        )
+    elif result.ok:
+        text = (
+            f"{head}\n项目：{html_escape(title)}\n"
+            f"结果：🏆 已领取（未返回内容）\n耗时：{elapsed:.1f}s"
+        )
+    else:
+        reason_text = {
+            "dry_run": "试运行（未真正提交）",
+            "out_of_stock": "已抢光",
+            "already_received": "已领取过",
+            "no_session": "缺少会话（需同步 session）",
+            "clearance_failed": "Cloudflare 凭证获取失败",
+            "cloudflare": "Cloudflare 拦截",
+            "captcha_failed": "打码失败",
+            "bad_link": "链接无法解析",
+            "ended": "项目已过期",
+            "completed": "项目已结束",
+            "trust_level": "社区等级不足",
+            "insufficient_score": "积分不足",
+            "not_found": "项目不存在",
+            "refused": "被拒绝",
+        }.get(result.reason, result.reason or "未知原因")
+        detail = f"\n详情：{html_escape(result.error)}" if result.error else ""
+        text = (
+            f"{head}\n项目：{html_escape(title)}\n"
+            f"结果：⚠️ {html_escape(reason_text)}\n"
+            f"链接：{html_escape(link)}{detail}\n耗时：{elapsed:.1f}s"
+        )
+    if await admin_send_monitor(text, name):
+        mark_cdk_claim_notified(row_id)
+
+
+async def fetch_topic_body(monitor: dict[str, Any], item: MonitorItem, client: httpx.AsyncClient) -> str | None:
+    """Fetch a topic's body and pull any give-away links out of it.
+
+    The body is a means to an end: it is never rendered into a notification.
+    Its only purpose is to be scanned for cdk.linux.do links, which do not show
+    up in the list metadata the keyword filter sees.
+
+    Reuses the monitor's already-warmed cf session (same cache key) so only the
+    very first fetch ever pays a browser warmup; subsequent ones are single
+    curl_cffi requests. Never raises: a missing body must not cost the
+    notification.
+
+    Returns the full body text (for callers that want it); the extracted links
+    are always published on ``item.cdk_links``.
+    """
+    settings = fetch_topic_body_settings(monitor)
+    if not settings["enabled"]:
+        return None
+    topic_id = linuxdo_topic_id(item.key, item.link)
+    if not topic_id:
+        return None
+    raw_url = f"https://{LINUXDO_HOST}/raw/{topic_id}"
+    derived = {
+        **monitor,
+        "url": raw_url,
+        "cf_cache_key_url": monitor.get("url"),
+        "cf_warmup_url": monitor.get("cf_warmup_url") or f"https://{LINUXDO_HOST}/",
+        "cf_bypass": True,
+    }
+    try:
+        raw = await fetch_url(client, derived)
+    except Exception as e:
+        logger.warning("topic body fetch failed topic=%s error=%s", topic_id, e)
+        return None
+    # Always scan the untruncated text: a link is often the last thing in a post
+    # and any clipping would silently drop exactly what we came for.
+    text = strip_raw_body(raw, 0)
+    item.cdk_links = extract_cdk_links(text)
+    body = strip_raw_body(raw, int(settings["max_chars"]))
+    if body:
+        logger.info(
+            "topic body fetched topic=%s chars=%s cdk_links=%s",
+            topic_id, len(body), len(item.cdk_links),
+        )
+    return body or None
 
 
 def normalize_json_body(body: str) -> str:
@@ -3225,6 +3919,20 @@ def should_notify_and_update(monitor: dict[str, Any], item: MonitorItem, hits: l
     return reasons
 
 
+def monitor_item_seen(monitor: dict[str, Any], item: MonitorItem) -> bool:
+    """Whether this monitor/item pair has already been recorded in monitor_state.
+
+    Used to keep the CDK body peek off the hot path: only genuinely new posts
+    pay for the extra request.
+    """
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM monitor_state WHERE monitor_name=? AND item_key=?",
+            (monitor["name"], item.key),
+        ).fetchone()
+    return row is not None
+
+
 def event_not_sent(event_key: str, monitor_name: str, title: str, link: str) -> bool:
     with closing(db()) as conn:
         try:
@@ -3354,9 +4062,23 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
             hits = keyword_hits(f"{item.title} {item.text}", keywords)
             # If keywords are configured and keyword_match is enabled, do not push unrelated new posts.
             notify_on = monitor.get("notify_on") or {}
-            if keywords and notify_on.get("keyword_match", True) and not hits and not (notify_on.get("price_change") or notify_on.get("stock_change")):
-                should_notify_and_update(monitor, item, [])  # still remember state to avoid later old flood
-                continue
+            keyword_gate = keywords and notify_on.get("keyword_match", True) and not hits and not (notify_on.get("price_change") or notify_on.get("stock_change"))
+            if keyword_gate:
+                # A give-away link lives in the body, which is not part of the
+                # keyword haystack. Peek at the body of not-yet-seen posts so a
+                # CDK post with an unremarkable title still gets through; the
+                # peek is skipped for items already in monitor_state, so it only
+                # ever runs once per genuinely new post.
+                if cdk_alert_enabled(monitor) and not monitor_item_seen(monitor, item):
+                    peek_body = await fetch_topic_body(monitor, item, client)
+                    if peek_body:
+                        item.body = peek_body
+                    if item.cdk_links:
+                        hits = [f"CDK 链接 x{len(item.cdk_links)}"]
+                        keyword_gate = False
+                if keyword_gate:
+                    should_notify_and_update(monitor, item, [])  # still remember state to avoid later old flood
+                    continue
             reasons = should_notify_and_update(monitor, item, hits)
             if not reasons:
                 continue
@@ -3366,6 +4088,20 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
             if not event_not_sent(event_key, name, item.title, item.link):
                 continue
             notify_on_tg = bool(monitor.get("notify_telegram", True))
+            # The body itself is never shown: it exists only so a give-away link
+            # can be pulled out of it. Only notifications that actually go out
+            # pay for the fetch.
+            if notify_on_tg and not item.body:
+                item.body = await fetch_topic_body(monitor, item, client)
+            cdk_links = item.cdk_links or []
+            cdk_line = ""
+            if cdk_links:
+                cdk_line = "🎁 CDK：\n" + "\n".join(html_escape(link) for link in cdk_links) + "\n"
+            # The link goes out *first*: a give-away is first-come-first-served
+            # and a claim can spend 30-180s in captcha polling, so waiting for it
+            # would delay the notification past the point of being useful. The
+            # claim is dispatched as its own task and reports its result as a
+            # follow-up message.
             if is_forum:
                 text = (
                     f"[新帖命中] {html_escape(name)}\n"
@@ -3375,6 +4111,7 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                     f"链接：{html_escape(item.link)}\n"
                     f"命中：{html_escape('; '.join(reasons))}\n"
                     f"发布时间：{html_escape(item.published or '-')}\n"
+                    f"{cdk_line}"
                     f"检查时间：{html_escape(now_iso())}"
                 )
             else:
@@ -3385,9 +4122,22 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                     f"命中：{html_escape('; '.join(reasons))}\n"
                     f"价格：{html_escape(item.price or '-')}\n"
                     f"库存：{html_escape(item.stock or '-')}\n"
+                    f"{cdk_line}"
                     f"时间：{html_escape(now_iso())}"
                 )
             record_monitor_event(name, item.title, item.link, reasons, notify_on_tg)
+            # Dispatch the claim *before* the notification and independently of
+            # its outcome. A CDK is first-come-first-served, so a Telegram
+            # hiccup, a muted monitor, or a failed send must never cost us the
+            # grab. schedule_cdk_claim only creates the task; it does not run
+            # until this coroutine yields, which happens at the send below -- so
+            # the link still reaches the user first.
+            if cdk_links:
+                logger.info(
+                    "cdk links notified monitor=%s topic=%s links=%s",
+                    name, linuxdo_topic_id(item.key, item.link) or item.key, len(cdk_links),
+                )
+                schedule_cdk_claim(monitor, cdk_links)
             if not notify_on_tg:
                 sent_count += 1
                 continue
@@ -3480,6 +4230,12 @@ async def flush_pending_loop() -> None:
             await flush_pending_inbox()
         except Exception:
             logger.exception("flush_pending_loop failed")
+        # Re-deliver any redeemed code whose follow-up message never went out
+        # (e.g. Telegram was down when the claim finished).
+        try:
+            await flush_unsent_cdk_claims()
+        except Exception:
+            logger.exception("cdk claim flush failed")
         await asyncio.sleep(60)
 
 
