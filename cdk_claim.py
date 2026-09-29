@@ -294,70 +294,144 @@ def fetch_cdk_clearance(*, force: bool = False, timeout: int = 150) -> tuple[dic
     return normalized, ua
 
 
-_clearance_cache: dict[str, Any] = {"cookies": {}, "user_agent": "", "expires_at": 0.0}
+_clearance_cache: dict[str, Any] = {"cookies": {}, "user_agent": ""}
+
+# Probe bookkeeping. The clearance has no TTL: like the monitor's cf session it
+# is kept until a probe proves Cloudflare no longer accepts it.
+_probe_state: dict[str, Any] = {"last_probe_at": 0.0, "url": ""}
 
 
-def verify_clearance(cookies: dict[str, str], user_agent: str, session_id: str = "") -> bool:
-    """Check a candidate clearance actually passes cdk.linux.do.
+def cdk_clearance_probe_seconds() -> float:
+    """How often the cached clearance is probed. Default 10 minutes."""
+    return max(60.0, float(os.getenv("CDK_CLEARANCE_PROBE_SECONDS", "600")))
+
+
+def remember_cdk_link(link: str) -> None:
+    """Remember the most recent give-away link, which becomes the probe target.
+
+    Probing a give-away URL is both the most faithful check -- it is exactly
+    what a claim requests -- and the most stable one. Measured over five
+    back-to-back probes each: the site root was challenged 2/5 times and
+    /api/v1/oauth/user-info is challenged intermittently, while
+    /receive/<id> answered 200 on every probe.
+    """
+    project_id = project_id_from_link(link)
+    if project_id:
+        _probe_state["url"] = f"{CDK_BASE}/receive/{project_id}"
+
+
+def clearance_probe_url() -> str:
+    """The URL a cached clearance is probed against.
+
+    Falls back to the warmup page until a give-away has been seen, so the very
+    first claim after a restart still has something valid to check against.
+    """
+    return str(_probe_state.get("url") or "") or f"{CDK_BASE}/dashboard"
+
+
+def verify_clearance(
+    cookies: dict[str, str], user_agent: str, session_id: str = "", url: str = ""
+) -> bool:
+    """Check a candidate clearance still passes cdk.linux.do.
 
     The bypass service hands back whatever session it currently holds, and a
     replacement clearance arrives with a new User-Agent (observed: FF143 ->
-    FF140 across two consecutive warmups). A clearance is only valid for the
-    UA that solved the challenge, so caches built before a warmup go stale and
-    every request 403s until something forces a refresh. Verifying once here
-    costs ~200ms and removes that whole failure mode.
+    FF140 across two consecutive warmups). A clearance is only valid for the UA
+    that solved the challenge, so a stale cache 403s every request until
+    something forces a refresh.
+
+    The probe target matters as much as the probe itself: pointing it at a path
+    Cloudflare samples would discard a perfectly healthy clearance and pay for a
+    new browser challenge. Hence the give-away link, not user-info.
     """
     if not cookies.get("cf_clearance"):
         return False
     jar = dict(cookies)
     if session_id:
         jar["linux_do_cdk_session_id"] = session_id
+    target = url or clearance_probe_url()
     try:
         client = _new_client(user_agent, jar)
         resp = client.get(
-            f"{CDK_BASE}/api/v1/oauth/user-info",
-            headers=_browser_headers(f"{CDK_BASE}/", user_agent),
+            target,
+            headers=_browser_headers(target, user_agent),
             timeout=20,
         )
     except Exception:
         return False
+    # A non-Cloudflare 4xx (an expired project answering 404, say) still proves
+    # the clearance was accepted, which is the only question being asked here.
     return not _challenge_like(resp) and resp.status_code < 500
 
 
-def cached_clearance(ttl: float = 300.0, session_id: str = "") -> tuple[dict[str, str], str]:
-    """Return a cdk.linux.do clearance that is known to work.
+def cached_clearance(session_id: str = "") -> tuple[dict[str, str], str]:
+    """Return a cdk.linux.do clearance, kept until a probe proves it dead.
 
-    Cached entries are re-verified before reuse, and a failed verification
-    escalates to ``force=True`` (which tells the bypass service to drop its own
-    cached session first). That escalation matters: without it the bypass keeps
-    replaying a session Cloudflare has already stopped accepting.
+    Deliberately has no TTL, mirroring the monitor's cf session: minting one
+    costs 43-72s of headless browser time, and replacing a clearance the origin
+    is still happily accepting only feeds the rate limiting that breaks it.
+    Instead the cache is re-used as-is between probes, and re-minted only when
+    a probe says Cloudflare has stopped accepting it.
     """
     now = time.time()
     cached = _clearance_cache
-    if (
-        cached["cookies"]
-        and "cf_clearance" in cached["cookies"]
-        and cached["expires_at"] > now
-        and verify_clearance(cached["cookies"], cached["user_agent"], session_id)
-    ):
-        return cached["cookies"], cached["user_agent"]
+    if cached.get("cookies") and "cf_clearance" in cached["cookies"]:
+        if now - float(_probe_state.get("last_probe_at") or 0.0) < cdk_clearance_probe_seconds():
+            return cached["cookies"], cached["user_agent"]
+        if verify_clearance(
+            cached["cookies"], cached["user_agent"], session_id, clearance_probe_url()
+        ):
+            _probe_state["last_probe_at"] = now
+            return cached["cookies"], cached["user_agent"]
+        # The probe says it is no longer accepted: mint a fresh one.
+        drop_clearance_cache()
 
     for force in (False, True):
         cookies, ua = fetch_cdk_clearance(force=force)
         if not cookies.get("cf_clearance") or not ua:
             continue
-        if verify_clearance(cookies, ua, session_id):
-            _clearance_cache.update(
-                {"cookies": cookies, "user_agent": ua, "expires_at": now + ttl}
-            )
+        if verify_clearance(cookies, ua, session_id, clearance_probe_url()):
+            _clearance_cache.update({"cookies": cookies, "user_agent": ua})
+            _probe_state["last_probe_at"] = now
             return cookies, ua
     # Nothing verified: hand back the last attempt so the caller's error path
     # reports the real response instead of a synthetic "missing cookie".
     return cookies, ua
 
 
+def refresh_clearance_if_stale(*, force: bool = False) -> dict[str, Any]:
+    """Probe (or mint) the clearance outside of a claim, for the timer job.
+
+    Keeping the cache warm is the point: a give-away posted after a long idle
+    stretch would otherwise pay 43-72s of browser time before its first request,
+    which a first-come-first-served grab cannot afford.
+    """
+    if force:
+        drop_clearance_cache()
+    session_id = ""
+    try:
+        session = load_cdk_session()
+        session_id = session.session_id if session.ok else ""
+    except Exception:
+        pass
+    try:
+        cookies, ua = cached_clearance(session_id=session_id)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "url": clearance_probe_url(),
+            "error": f"{type(exc).__name__}: {exc}"[:200],
+        }
+    return {
+        "ok": bool(cookies.get("cf_clearance")),
+        "url": clearance_probe_url(),
+        "ua": ua,
+    }
+
+
 def drop_clearance_cache() -> None:
-    _clearance_cache.update({"cookies": {}, "user_agent": "", "expires_at": 0.0})
+    _clearance_cache.update({"cookies": {}, "user_agent": ""})
+    _probe_state["last_probe_at"] = 0.0
 
 
 # --------------------------------------------------------------------------- #

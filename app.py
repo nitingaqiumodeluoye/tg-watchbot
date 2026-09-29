@@ -3707,6 +3707,14 @@ async def fetch_topic_body(monitor: dict[str, Any], item: MonitorItem, client: h
     # and any clipping would silently drop exactly what we came for.
     text = strip_raw_body(raw, 0)
     item.cdk_links = extract_cdk_links(text)
+    if item.cdk_links:
+        # Remembered so the periodic clearance probe targets a real give-away
+        # URL rather than a path Cloudflare samples.
+        try:
+            import cdk_claim as _cdk_claim
+            _cdk_claim.remember_cdk_link(item.cdk_links[0])
+        except Exception as e:
+            logger.debug("cdk probe link not remembered: %s", e)
     body = strip_raw_body(raw, int(settings["max_chars"]))
     if body:
         logger.info(
@@ -4259,6 +4267,58 @@ def schedule_monitors(scheduler: AsyncIOScheduler) -> None:
         job_key = stable_key(str(idx), name, m.get("url", ""))[:16]
         scheduler.add_job(run_monitor, "interval", seconds=interval, args=[m], id=f"monitor:{idx}:{job_key}", max_instances=1, coalesce=True, replace_existing=True, next_run_time=datetime.now(timezone.utc))
         logger.info("scheduled monitor %s every %ss", name, interval)
+    schedule_cdk_clearance_probe(scheduler)
+
+
+async def cdk_clearance_probe_job() -> None:
+    """Keep the cdk.linux.do clearance warm so a claim never starts cold.
+
+    The clearance has no TTL and is re-minted only when a probe proves
+    Cloudflare stopped accepting it, but that re-mint costs 43-72s of headless
+    browser time. Refreshing on a timer keeps that cost off the critical path of
+    a first-come-first-served grab.
+    """
+    try:
+        import cdk_claim as _cdk_claim
+    except Exception as e:
+        logger.warning("cdk clearance probe import failed: %s", e)
+        return
+    try:
+        status = await asyncio.to_thread(_cdk_claim.refresh_clearance_if_stale)
+    except Exception as e:
+        logger.warning("cdk clearance probe crashed: %s", e)
+        return
+    if status.get("ok"):
+        logger.info("cdk clearance probe ok url=%s", status.get("url"))
+    else:
+        logger.warning(
+            "cdk clearance probe failed url=%s error=%s",
+            status.get("url"), status.get("error") or "no cf_clearance",
+        )
+
+
+def schedule_cdk_clearance_probe(scheduler: AsyncIOScheduler) -> None:
+    """Register the clearance probe, but only when a monitor claims CDKs."""
+    monitors = config.get("monitors") or []
+    if not any(cdk_claim_enabled_for(m) for m in monitors):
+        return
+    try:
+        import cdk_claim as _cdk_claim
+        seconds = int(_cdk_claim.cdk_clearance_probe_seconds())
+    except Exception as e:
+        logger.warning("cdk clearance probe not scheduled: %s", e)
+        return
+    scheduler.add_job(
+        cdk_clearance_probe_job,
+        "interval",
+        seconds=seconds,
+        id="cdk:clearance-probe",
+        max_instances=1,
+        coalesce=True,
+        replace_existing=True,
+        next_run_time=datetime.now(timezone.utc),
+    )
+    logger.info("scheduled cdk clearance probe every %ss", seconds)
 
 
 

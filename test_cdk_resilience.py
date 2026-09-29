@@ -3,6 +3,7 @@
 Run: python test_cdk_resilience.py
 """
 import sys
+import time
 import types
 
 import cdk_claim as C
@@ -57,6 +58,11 @@ CLAIMABLE = {
 
 
 def main():
+    global ORIG
+    ORIG = {
+        name: getattr(C, name)
+        for name in ("cached_clearance", "verify_clearance", "fetch_cdk_clearance")
+    }
     print("\n=== 1. 预检：user-info 不可用时不能误判为 L0 ===")
     info = {**CLAIMABLE, "minimum_trust_level": 2}
     p = C.precheck_eligibility(info, {})
@@ -128,6 +134,76 @@ def main():
     )
     res = C.claim_link(LINK)
     check("打码失败但码已到手 -> 救回", res.ok and res.content == "RESCUED", f"{res.ok}/{res.content}")
+
+    print("\n=== 6. clearance：无 TTL，10 分钟探一次，探针用最近的 CDK 链接 ===")
+    C.cached_clearance = ORIG["cached_clearance"]
+    C.verify_clearance = ORIG["verify_clearance"]
+    C.fetch_cdk_clearance = ORIG["fetch_cdk_clearance"]
+
+    state = {"probes": 0, "url": "", "refetch": 0, "verify_ok": True}
+
+    def spy_verify(cookies, ua, session_id="", url=""):
+        state["probes"] += 1
+        state["url"] = url
+        # The old (cached) clearance fails, a freshly minted one passes -- the
+        # real shape of "Cloudflare stopped accepting it".
+        return state["verify_ok"] or str(cookies.get("cf_clearance", "")).startswith("C-new")
+
+    def spy_fetch(force=False, timeout=150):
+        state["refetch"] += 1
+        return {"cf_clearance": "C-new-%s" % force}, "UA-new-%s" % force
+
+    C.verify_clearance = spy_verify
+    C.fetch_cdk_clearance = spy_fetch
+    C.remember_cdk_link(f"https://cdk.linux.do/receive/{PID}")
+
+    def reset(cookie="C1", probe_age=0):
+        C._clearance_cache.update({"cookies": {"cf_clearance": cookie}, "user_agent": "UA1"})
+        C._probe_state.update({"last_probe_at": time.time() - probe_age, "url": f"{C.CDK_BASE}/receive/{PID}"})
+        state.update({"probes": 0, "refetch": 0, "verify_ok": True, "url": ""})
+
+    reset(probe_age=400)  # 超过旧的 300s TTL，但未到 10 分钟探测窗口
+    ck, ua = C.cached_clearance()
+    check(
+        "超过旧 TTL(300s) 但未到探测窗口 -> 直接复用，不探测不重取",
+        ck.get("cf_clearance") == "C1" and ua == "UA1" and state["probes"] == 0 and state["refetch"] == 0,
+        f"probes={state['probes']} refetch={state['refetch']}",
+    )
+
+    reset(probe_age=700)  # 超过 10 分钟探测窗口
+    ck, ua = C.cached_clearance()
+    check("超过 600s 探测窗口 -> 探测一次", state["probes"] == 1, state["probes"])
+    check("探测通过 -> 不重取，仍复用同一份", ck.get("cf_clearance") == "C1" and state["refetch"] == 0, ck)
+
+    reset(probe_age=700)
+    state["verify_ok"] = False  # 探测失败 = CF 已不接受
+    ck, ua = C.cached_clearance()
+    check("探测失败 -> 重新取 clearance", ck.get("cf_clearance") == "C-new-False", ck)
+    check("首次重取即成功 -> 未浪费 force=True 那一轮", state["refetch"] == 1, state["refetch"])
+
+    reset(probe_age=700)
+    C.cached_clearance()
+    check(
+        "探针 URL = 最近一次 CDK 链接（不是 user-info）",
+        state["url"] == f"{C.CDK_BASE}/receive/{PID}",
+        state["url"],
+    )
+    check(
+        "探测端点已不再是 user-info",
+        "user-info" not in (state["url"] or ""),
+        state["url"],
+    )
+
+    C.remember_cdk_link("https://example.com/not-a-cdk-link")
+    check(
+        "非法链接不覆盖已记住的探针 URL",
+        C.clearance_probe_url() == f"{C.CDK_BASE}/receive/{PID}",
+        C.clearance_probe_url(),
+    )
+
+    C.drop_clearance_cache()
+    check("drop 后探针计时归零", C._probe_state["last_probe_at"] == 0.0, C._probe_state["last_probe_at"])
+    check("drop 后缓存清空", not C._clearance_cache["cookies"], C._clearance_cache["cookies"])
 
     print(f"\n{'=' * 46}\n通过 {len(PASS)} / {len(PASS) + len(FAIL)}")
     if FAIL:
