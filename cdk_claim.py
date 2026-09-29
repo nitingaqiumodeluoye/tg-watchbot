@@ -25,6 +25,7 @@ asyncio loop with a 30-120s captcha poll.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import time
@@ -34,6 +35,8 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 
 import httpx
+
+logger = logging.getLogger("tg-watchbot.cdk_claim")
 
 try:  # curl_cffi gives us a browser-like TLS fingerprint for the direct calls
     from curl_cffi import requests as curl_requests
@@ -661,9 +664,11 @@ class Precheck:
     end_ts: float = 0.0
     waits_for_start: bool = False
     wait_seconds: float = 0.0
-    trust_level: int = 0
+    # ``None`` means "user-info could not be read", which is not the same as a
+    # real zero and must not trip the trust-level/score gates.
+    trust_level: int | None = None
     min_trust_level: int = 0
-    score: int = 0
+    score: int | None = None
     price: int = 0
     available: int | None = None
 
@@ -693,9 +698,11 @@ def precheck_eligibility(info: dict[str, Any], user: dict[str, Any]) -> Precheck
     p = Precheck()
     p.start_ts = parse_start_time(info.get("start_time"))
     p.end_ts = parse_start_time(info.get("end_time"))
-    p.trust_level = int(user.get("trust_level") or 0)
+    trust = user.get("trust_level")
+    p.trust_level = int(trust) if trust is not None else None
     p.min_trust_level = int(info.get("minimum_trust_level") or 0)
-    p.score = int(user.get("score") or 0)
+    score = user.get("score")
+    p.score = int(score) if score is not None else None
     try:
         p.price = int(float(info.get("price") or 0))
     except (TypeError, ValueError):
@@ -721,12 +728,12 @@ def precheck_eligibility(info: dict[str, Any], user: dict[str, Any]) -> Precheck
     # consulted: its values could not be verified against a live project.
     if info.get("is_completed"):
         return _reject(p, "completed", "项目已完成（is_completed）")
-    if p.min_trust_level and p.trust_level < p.min_trust_level:
+    if p.min_trust_level and p.trust_level is not None and p.trust_level < p.min_trust_level:
         return _reject(
             p, "trust_level",
             f"社区等级不足：需要 L{p.min_trust_level}，当前 L{p.trust_level}",
         )
-    if p.price > 0 and p.score < p.price:
+    if p.price > 0 and p.score is not None and p.score < p.price:
         return _reject(p, "insufficient_score", f"积分不足：需要 {p.price}，当前 {p.score}")
     if p.available is not None and p.available <= 0 and not p.waits_for_start:
         return _reject(p, "out_of_stock", "库存为 0 且已过开始时间")
@@ -760,6 +767,35 @@ def post_receive(project_id: str, captcha_token: str, client) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+
+def confirm_received(result: ClaimResult, session) -> None:
+    """Re-read the project after a failed claim: the code may be ours anyway.
+
+    A Cloudflare challenge or a timeout can hit the *response* of a POST the
+    server had already committed. The project document still carries
+    ``is_received``/``received_content``, and a first-come-first-served code can
+    never be regenerated, so a failure is not accepted until the project has
+    been read back.
+    """
+    if result.ok or not result.project_id:
+        return
+    try:
+        cookies, ua = cached_clearance(session_id=session.session_id)
+        jar = dict(cookies)
+        jar["linux_do_cdk_session_id"] = session.session_id
+        client = _new_client(ua, jar)
+        info = get_project_info(result.project_id, client)
+    except Exception as exc:
+        logger.info("cdk confirm skipped project=%s: %s", result.project_id, exc)
+        return
+    if info.get("is_received") and info.get("received_content"):
+        logger.info("cdk claim confirmed despite reported failure project=%s", result.project_id)
+        result.ok = True
+        result.already_received = False
+        result.content = str(info["received_content"])
+        result.reason = "confirmed_after_failure"
+        result.error = ""
+
 
 def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = False) -> ClaimResult:
     """Claim the give-away at ``link`` end to end.
@@ -815,19 +851,39 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
         # Free eligibility gate before any captcha credit is spent. A project we
         # can never claim (claimed already, expired, above our trust level, or
         # genuinely sold out) is reported instead of being retried for 30s.
+        user: dict[str, Any] = {}
         try:
             user = get_user_info(client)
         except PermissionError:
-            raise
+            # user-info is challenged intermittently on its own, while the
+            # project endpoint keeps answering with the very same clearance.
+            # It gates only the trust-level/score checks, so a challenge here
+            # must not forfeit a claimable give-away: refresh the clearance,
+            # retry once, then carry on with those two gates unknown.
+            logger.info("cdk user-info challenged, refreshing clearance and retrying")
+            drop_clearance_cache()
+            try:
+                cookies, clear_ua = cached_clearance(session_id=session.session_id)
+                user_agent = clear_ua or user_agent
+                jar = dict(cookies)
+                jar["linux_do_cdk_session_id"] = session.session_id
+                client = _new_client(user_agent, jar)
+                user = get_user_info(client)
+            except Exception as exc:
+                logger.info("cdk user-info unavailable (%s), trust/score gates skipped", exc)
+                user = {}
         except Exception as exc:
             # A missing user-info must not block a claim: the precheck simply
             # cannot evaluate the trust-level/score gates without it.
+            logger.info("cdk user-info failed (%s), trust/score gates skipped", exc)
             user = {}
         pre = precheck_eligibility(info, user)
         result.start_time = pre.start_ts
-        result.trust_level = pre.trust_level
+        # -1 marks "unknown" (user-info unavailable); these are diagnostic only
+        # and are never persisted or compared again.
+        result.trust_level = pre.trust_level if pre.trust_level is not None else -1
         result.min_trust_level = pre.min_trust_level
-        result.score = pre.score
+        result.score = pre.score if pre.score is not None else -1
         result.price = pre.price
         if not pre.go:
             result.reason = pre.reason
@@ -863,7 +919,7 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
             if not token:
                 result.reason = "captcha_failed"
                 result.error = "captcha solver returned an empty token"
-                return result
+                break
 
             data = post_receive(result.project_id, token, client)
             error_msg = str(data.get("error_msg") or "").strip()
@@ -872,13 +928,13 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
                 result.ok = True
                 result.content = str(payload.get("itemContent") or "")
                 result.reason = "claimed"
-                return result
+                break
 
             if "已领取" in error_msg or "重复" in error_msg:
                 result.already_received = True
                 result.reason = "refused"
                 result.error = error_msg
-                return result
+                break
 
             # Split the retry decision in two, because the two families cost
             # very different amounts. A timing or rate-limit complaint clears on
@@ -894,12 +950,12 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
                 if not within_grace:
                     result.reason = "out_of_stock"
                     result.error = error_msg
-                    return result
+                    break
                 retryable = True
             if not retryable or time.time() >= deadline:
                 result.reason = "refused"
                 result.error = error_msg
-                return result
+                break
             time.sleep(1.0)
     except PermissionError:
         # Clearance died mid-flight: drop it so the next attempt re-warms.
@@ -911,6 +967,11 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
         result.error = f"{type(exc).__name__}: {exc}"[:300]
     finally:
         result.elapsed_ms = int((time.time() - started) * 1000)
+
+    # A failure is not final until the project has been read back: the code may
+    # have been handed out before the response was lost.
+    if not result.ok:
+        confirm_received(result, session)
     return result
 
 
