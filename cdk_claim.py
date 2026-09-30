@@ -80,6 +80,8 @@ class ClaimResult:
     min_trust_level: int = 0
     score: int = 0
     price: int = 0
+    payment_url: str = ""
+    payment_trade_no: str = ""
 
     def summary(self) -> str:
         if self.ok:
@@ -997,8 +999,18 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
 
             data = post_receive(result.project_id, token, client)
             error_msg = str(data.get("error_msg") or "").strip()
+            payload = data.get("data") or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            # Paid giveaways are a normal business result, not a successful
+            # claim: return the payment URL so the operator can complete it.
+            if payload.get("require_payment"):
+                result.payment_url = str(payload.get("pay_url") or "")
+                result.payment_trade_no = str(payload.get("trade_no") or "")
+                result.reason = "payment_required"
+                result.error = "需要支付 LDC 后领取" if result.payment_url else "需要支付 LDC，但接口未返回支付链接"
+                break
             if not error_msg:
-                payload = data.get("data") or {}
                 result.ok = True
                 result.content = str(payload.get("itemContent") or "")
                 result.reason = "claimed"
@@ -1044,7 +1056,7 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
 
     # A failure is not final until the project has been read back: the code may
     # have been handed out before the response was lost.
-    if not result.ok:
+    if not result.ok and result.reason != "payment_required":
         confirm_received(result, session)
     return result
 

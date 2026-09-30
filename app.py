@@ -512,6 +512,13 @@ def init_db() -> None:
             );
             """
         )
+        for column in ("payment_url", "payment_trade_no"):
+            try:
+                conn.execute(f"ALTER TABLE cdk_claims ADD COLUMN {column} TEXT DEFAULT ''")
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+
         for sql in [
             "ALTER TABLE inbox_messages ADD COLUMN direction TEXT DEFAULT 'in'",
             "ALTER TABLE inbox_messages ADD COLUMN source TEXT DEFAULT 'user'",
@@ -3436,6 +3443,8 @@ def record_cdk_claim(
     dry_run: bool,
     elapsed_ms: int,
     attempts: int,
+    payment_url: str = "",
+    payment_trade_no: str = "",
 ) -> int:
     """Persist one claim outcome (and its code) so a failed send cannot lose it.
 
@@ -3449,14 +3458,14 @@ def record_cdk_claim(
                 INSERT INTO cdk_claims(
                     project_id, project_name, link, monitor_name, ok, reason, detail,
                     content, already_received, dry_run, elapsed_ms, attempts,
-                    notified, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?)
+                    notified, created_at, payment_url, payment_trade_no
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?)
                 """,
                 (
                     project_id, project_name, link, monitor_name,
                     1 if ok else 0, reason, detail[:600], content,
                     1 if already_received else 0, 1 if dry_run else 0,
-                    int(elapsed_ms), int(attempts), now_iso(),
+                    int(elapsed_ms), int(attempts), now_iso(), payment_url, payment_trade_no,
                 ),
             )
             conn.commit()
@@ -3493,7 +3502,10 @@ def unsent_cdk_claims(limit: int = 20) -> list[sqlite3.Row]:
             conn.execute(
                 """
                 SELECT * FROM cdk_claims
-                WHERE ok=1 AND notified=0 AND content IS NOT NULL AND content != ''
+                WHERE notified=0 AND (
+                    (ok=1 AND content IS NOT NULL AND content != '')
+                    OR (reason='payment_required' AND payment_url IS NOT NULL AND payment_url != '')
+                )
                 ORDER BY id ASC LIMIT ?
                 """,
                 (int(limit),),
@@ -3505,6 +3517,14 @@ def _cdk_claim_text_from_row(row: sqlite3.Row, *, recovered: bool = False) -> st
     title = row["project_name"] or row["project_id"]
     label = "已领取过（此前领过）" if row["already_received"] else "领取成功"
     head = "【CDK 自动领取·补发】" if recovered else "【CDK 自动领取】"
+    if row["reason"] == "payment_required":
+        return (
+            f"{head}{html_escape(row['monitor_name'] or '')}\n"
+            f"项目：{html_escape(title)}\n"
+            f"结果：💳 需要支付 LDC 后领取\n"
+            f"支付链接：{html_escape(row['payment_url'] or '')}\n"
+            f"交易号：{html_escape(row['payment_trade_no'] or '-')}"
+        )
     return (
         f"{head}{html_escape(row['monitor_name'] or '')}\n"
         f"项目：{html_escape(title)}\n"
@@ -3624,6 +3644,8 @@ async def _run_cdk_claim(
         dry_run=bool(dry_run),
         elapsed_ms=int(result.elapsed_ms or elapsed * 1000),
         attempts=int(result.attempts or 0),
+        payment_url=result.payment_url or "",
+        payment_trade_no=result.payment_trade_no or "",
     )
 
     title = result.project_name or project_id
@@ -3642,8 +3664,19 @@ async def _run_cdk_claim(
             f"{head}\n项目：{html_escape(title)}\n"
             f"结果：🏆 已领取（未返回内容）\n耗时：{elapsed:.1f}s"
         )
+    elif result.reason == "payment_required" and result.payment_url:
+        trade_line = f"交易号：{html_escape(result.payment_trade_no)}" if result.payment_trade_no else ""
+        text = chr(10).join(line for line in (
+            head,
+            f"项目：{html_escape(title)}",
+            "结果：💳 需要支付 LDC 后领取",
+            trade_line,
+            f"支付链接：{html_escape(result.payment_url)}",
+            f"耗时：{elapsed:.1f}s",
+        ) if line)
     else:
         reason_text = {
+            "payment_required": "需要支付 LDC 后领取",
             "dry_run": "试运行（未真正提交）",
             "out_of_stock": "已抢光",
             "already_received": "已领取过",
