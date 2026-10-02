@@ -548,6 +548,73 @@ def html_escape(text: Any) -> str:
     return html.escape(str(text or ""), quote=False)
 
 
+def gotify_url() -> str:
+    return (os.getenv("GOTIFY_URL", "https://gotify.newjeans.buzz") or "").strip().rstrip("/")
+
+
+def gotify_token() -> str:
+    return (os.getenv("GOTIFY_TOKEN", "") or "").strip()
+
+
+def gotify_priority() -> int:
+    try:
+        return max(0, min(10, int(os.getenv("GOTIFY_PRIORITY", "8"))))
+    except (TypeError, ValueError):
+        return 8
+
+
+_gotify_missing_token_logged = False
+
+
+async def send_gotify(title: str, message: str) -> bool:
+    """Send a best-effort Gotify notification."""
+    global _gotify_missing_token_logged
+    token = gotify_token()
+    if not token:
+        if not _gotify_missing_token_logged:
+            logger.warning("gotify disabled: GOTIFY_TOKEN is not configured")
+            _gotify_missing_token_logged = True
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10.0, trust_env=False) as client:
+            resp = await client.post(
+                f"{gotify_url()}/message",
+                headers={"X-Gotify-Key": token, "Content-Type": "application/json"},
+                json={"title": str(title)[:250], "message": str(message)[:4096], "priority": gotify_priority()},
+            )
+        if resp.status_code >= 300:
+            logger.warning("gotify send failed status=%s", resp.status_code)
+            return False
+        return True
+    except Exception as exc:
+        logger.warning("gotify send failed: %s", type(exc).__name__)
+        return False
+
+
+def gotify_cdk_links_message(monitor_name: str, item: MonitorItem, links: list[str]) -> str:
+    return "\n".join([
+        "检测到 CDK 链接", f"监控：{monitor_name}", f"标题：{item.title}",
+        f"来源：{item.link}", "CDK：", *links,
+    ])
+
+
+def gotify_cdk_result_message(monitor_name: str, title: str, link: str, result: Any, elapsed: float) -> str:
+    lines = [
+        "CDK 自动领取结果", f"监控：{monitor_name}", f"项目：{title}",
+        f"结果：{result.reason or ('成功' if result.ok else '失败')}", f"耗时：{elapsed:.1f}s",
+    ]
+    if result.content:
+        lines.extend(["CDK：", result.content])
+    if result.payment_url:
+        lines.extend(["支付链接：", result.payment_url])
+    if result.payment_trade_no:
+        lines.append(f"交易号：{result.payment_trade_no}")
+    if result.error:
+        lines.append(f"详情：{result.error}")
+    lines.append(f"来源：{link}")
+    return "\n".join(lines)
+
+
 def app_icon_data_uri() -> str:
     svg = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' fill='%23f0f0f0'/><circle cx='22' cy='22' r='13' fill='%23d02020' stroke='%23121212' stroke-width='4'/><rect x='30' y='12' width='22' height='22' fill='%231040c0' stroke='%23121212' stroke-width='4'/><path d='M12 52 L30 30 L48 52 Z' fill='%23f0c020' stroke='%23121212' stroke-width='4'/></svg>"""
     return "data:image/svg+xml," + svg
@@ -3614,6 +3681,11 @@ async def _run_cdk_claim(
         logger.exception("cdk claim crashed monitor=%s project=%s: %s", name, project_id, e)
         cdk_claims_in_flight.discard(key)
         cdk_claims_done[key] = time.time()
+        error_text = str(e)[:200]
+        await send_gotify(
+            f"CDK 领取异常：{name}",
+            f"CDK 自动领取异常\n监控：{name}\n项目：{project_id}\n详情：{error_text}",
+        )
         await admin_send_monitor(
             f"⚠️ CDK 自动领取异常\n项目：{html_escape(project_id)}\n"
             f"错误：{html_escape(str(e)[:200])}",
@@ -3698,6 +3770,10 @@ async def _run_cdk_claim(
             f"结果：⚠️ {html_escape(reason_text)}\n"
             f"链接：{html_escape(link)}{detail}\n耗时：{elapsed:.1f}s"
         )
+    await send_gotify(
+        f"CDK 领取结果：{name}",
+        gotify_cdk_result_message(name, title, link, result, elapsed),
+    )
     if await admin_send_monitor(text, name):
         mark_cdk_claim_notified(row_id)
 
@@ -4177,6 +4253,10 @@ async def run_monitor(monitor: dict[str, Any]) -> int:
                 logger.info(
                     "cdk links notified monitor=%s topic=%s links=%s",
                     name, linuxdo_topic_id(item.key, item.link) or item.key, len(cdk_links),
+                )
+                asyncio.create_task(
+                    send_gotify(f"CDK 链接：{name}", gotify_cdk_links_message(name, item, cdk_links)),
+                    name="gotify-cdk-links",
                 )
                 schedule_cdk_claim(monitor, cdk_links)
             if not notify_on_tg:
