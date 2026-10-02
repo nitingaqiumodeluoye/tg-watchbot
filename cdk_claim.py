@@ -126,6 +126,14 @@ def cdk_captcha_timeout_seconds() -> int:
     return max(30, int(os.getenv("CDK_CAPTCHA_TIMEOUT_SECONDS", "180")))
 
 
+def cdk_cf_retry_limit() -> int:
+    """Maximum clearance refresh retries per claim phase after a CF challenge."""
+    try:
+        return max(0, min(3, int(os.getenv("CDK_CF_RETRY_LIMIT", "1"))))
+    except ValueError:
+        return 1
+
+
 def cdk_start_wait_max_seconds() -> float:
     """How long a claim may sit waiting for the project's start_time.
 
@@ -914,7 +922,31 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
 
     client = _new_client(user_agent, jar)
     try:
-        info = get_project_info(result.project_id, client)
+        # A project query can be challenged even when the cached clearance
+        # recently passed the /receive probe. Refresh once and retry the query
+        # before abandoning the claim.
+        project_cf_retries = 0
+        while True:
+            try:
+                info = get_project_info(result.project_id, client)
+                break
+            except PermissionError:
+                if project_cf_retries >= cdk_cf_retry_limit():
+                    raise
+                project_cf_retries += 1
+                logger.info(
+                    "cdk project query challenged, refreshing clearance and retrying "
+                    "project=%s retry=%d",
+                    result.project_id, project_cf_retries,
+                )
+                drop_clearance_cache()
+                cookies, clear_ua = cached_clearance(session_id=session.session_id)
+                if "cf_clearance" not in cookies:
+                    raise PermissionError("cloudflare")
+                user_agent = clear_ua or user_agent
+                jar = dict(cookies)
+                jar["linux_do_cdk_session_id"] = session.session_id
+                client = _new_client(user_agent, jar)
         result.project_name = str(info.get("name") or "")
         if info.get("is_received"):
             result.already_received = True
@@ -985,8 +1017,11 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
 
         # Retry loop: right after the start_time the project can still report
         # no stock for a second or two, or reject a stale captcha token. Each
-        # pass solves a fresh token and retries until the window closes.
+        # pass solves a fresh token and retries until the window closes. A CF
+        # challenge refreshes the clearance and rebuilds the client before the
+        # next pass, but is limited separately from normal business retries.
         attempt = 0
+        receive_cf_retries = 0
         deadline = retry_deadline(start_ts)
         while True:
             attempt += 1
@@ -997,7 +1032,27 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
                 result.error = "captcha solver returned an empty token"
                 break
 
-            data = post_receive(result.project_id, token, client)
+            try:
+                data = post_receive(result.project_id, token, client)
+            except PermissionError:
+                if receive_cf_retries >= cdk_cf_retry_limit():
+                    raise
+                receive_cf_retries += 1
+                logger.info(
+                    "cdk receive challenged, refreshing clearance and retrying "
+                    "project=%s retry=%d",
+                    result.project_id, receive_cf_retries,
+                )
+                drop_clearance_cache()
+                cookies, clear_ua = cached_clearance(session_id=session.session_id)
+                if "cf_clearance" not in cookies:
+                    raise PermissionError("cloudflare")
+                user_agent = clear_ua or user_agent
+                jar = dict(cookies)
+                jar["linux_do_cdk_session_id"] = session.session_id
+                client = _new_client(user_agent, jar)
+                # The next loop iteration solves a fresh hCaptcha token too.
+                continue
             error_msg = str(data.get("error_msg") or "").strip()
             payload = data.get("data") or {}
             if not isinstance(payload, dict):
