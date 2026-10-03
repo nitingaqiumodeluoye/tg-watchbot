@@ -354,12 +354,14 @@ def verify_clearance(
     Cloudflare samples would discard a perfectly healthy clearance and pay for a
     new browser challenge. Hence the give-away link, not user-info.
     """
-    if not cookies.get("cf_clearance"):
+    target = url or clearance_probe_url()
+    if not cookies.get("cf_clearance") or not user_agent:
+        logger.warning("cdk clearance validation failed url=%s reason=missing_credentials", target)
         return False
     jar = dict(cookies)
     if session_id:
         jar["linux_do_cdk_session_id"] = session_id
-    target = url or clearance_probe_url()
+    client = None
     try:
         client = _new_client(user_agent, jar)
         resp = client.get(
@@ -367,11 +369,28 @@ def verify_clearance(
             headers=_browser_headers(target, user_agent),
             timeout=20,
         )
-    except Exception:
+        mitigated = str(resp.headers.get("cf-mitigated", "")).strip().lower()
+        challenged = mitigated == "challenge" or _challenge_like(resp)
+        # A rejected or unavailable endpoint is not evidence of good health.
+        verified = not challenged and 200 <= resp.status_code < 300
+        logger.log(
+            logging.INFO if verified else logging.WARNING,
+            "cdk clearance validation url=%s status=%s cf_mitigated=%s challenge=%s verified=%s",
+            target, resp.status_code, mitigated or "none", challenged, verified,
+        )
+        return verified
+    except Exception as exc:
+        logger.warning(
+            "cdk clearance validation failed url=%s reason=request_error error_type=%s",
+            target, type(exc).__name__,
+        )
         return False
-    # A non-Cloudflare 4xx (an expired project answering 404, say) still proves
-    # the clearance was accepted, which is the only question being asked here.
-    return not _challenge_like(resp) and resp.status_code < 500
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 def cached_clearance(session_id: str = "") -> tuple[dict[str, str], str]:
@@ -391,7 +410,7 @@ def cached_clearance(session_id: str = "") -> tuple[dict[str, str], str]:
         if verify_clearance(
             cached["cookies"], cached["user_agent"], session_id, clearance_probe_url()
         ):
-            _probe_state["last_probe_at"] = now
+            _probe_state["last_probe_at"] = time.time()
             return cached["cookies"], cached["user_agent"]
         # The probe says it is no longer accepted: mint a fresh one.
         drop_clearance_cache()
@@ -402,11 +421,11 @@ def cached_clearance(session_id: str = "") -> tuple[dict[str, str], str]:
             continue
         if verify_clearance(cookies, ua, session_id, clearance_probe_url()):
             _clearance_cache.update({"cookies": cookies, "user_agent": ua})
-            _probe_state["last_probe_at"] = now
+            _probe_state["last_probe_at"] = time.time()
             return cookies, ua
-    # Nothing verified: hand back the last attempt so the caller's error path
-    # reports the real response instead of a synthetic "missing cookie".
-    return cookies, ua
+    # Never expose an unverified candidate as a healthy cached session.
+    drop_clearance_cache()
+    raise RuntimeError("CDK clearance validation failed; no verified session available")
 
 
 def refresh_clearance_if_stale(*, force: bool = False) -> dict[str, Any]:
@@ -433,8 +452,9 @@ def refresh_clearance_if_stale(*, force: bool = False) -> dict[str, Any]:
             "error": f"{type(exc).__name__}: {exc}"[:200],
         }
     return {
-        "ok": bool(cookies.get("cf_clearance")),
+        "ok": bool(cookies.get("cf_clearance") and ua),
         "url": clearance_probe_url(),
+        "verified_at": float(_probe_state.get("last_probe_at") or 0.0),
         "ua": ua,
     }
 
