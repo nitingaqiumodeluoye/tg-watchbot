@@ -261,13 +261,17 @@ class RefreshCfCookieCacheTests(unittest.IsolatedAsyncioTestCase):
             "https://linux.do/c/welfare/36.json": self._jar("_cfuvid", "_t"),
         }
         monitor = self._monitor()
-        self.assertTrue(await app.refresh_cf_cookie_cache(None, monitor))
+        # The target URL must still be tried -- but a session with no cf_clearance
+        # is not cached (hardened 2026-09-27: caching it made every later direct
+        # fetch fail until something forced a real challenge), so this is a failed
+        # warmup that the caller escalates to force=True.
+        self.assertFalse(await app.refresh_cf_cookie_cache(None, monitor))
         # Warmup first, then the monitored URL as the fallback.
         self.assertEqual(
             self._get_targets(),
             ["https://linux.do/", "https://linux.do/c/welfare/36.json"],
         )
-        self.assertIn("_t", app.cf_cached_session(monitor)["cookies"])
+        self.assertIsNone(app.cf_cached_session(monitor))
 
     async def test_force_invalidates_bypass_cache_exactly_once(self):
         _FakeAsyncClient.payloads = {
@@ -358,7 +362,8 @@ class RefreshCfCookieCacheTests(unittest.IsolatedAsyncioTestCase):
             "https://linux.do/c/welfare/36.json": self._jar("_cfuvid", "_t"),
         }
         monitor = self._monitor()
-        self.assertTrue(await app.refresh_cf_cookie_cache(None, monitor))
+        # Still a failed warmup: the returned jar carries no cf_clearance.
+        self.assertFalse(await app.refresh_cf_cookie_cache(None, monitor))
         self.assertEqual(self._get_targets(), [
             "https://linux.do/",
             "https://linux.do/c/welfare/36.json",
@@ -422,7 +427,8 @@ class InvalidatedSessionRetryTests(unittest.IsolatedAsyncioTestCase):
         app.CurlAsyncSession = lambda **kwargs: _Session()
         try:
             # The clearance is rejected -> fetch fails and the cache entry is dropped.
-            self.assertIsNone(await app.fetch_with_cf_cookies(monitor, 20))
+            result = await app.fetch_with_cf_cookies(monitor, 20)
+            self.assertFalse(result.ok)
             self.assertIsNone(app.cf_cached_session(monitor))
             self.assertNotIn(app.cf_cache_key(monitor), app.cf_cookie_cache)
         finally:
@@ -480,7 +486,7 @@ class CfDirectPauseTests(unittest.IsolatedAsyncioTestCase):
 
     def test_defaults(self):
         monitor = self._monitor()
-        self.assertEqual(app.cf_direct_failure_limit(), 2)
+        self.assertEqual(app.cf_direct_failure_limit(), 10)
         self.assertEqual(app.cf_direct_block_seconds(), 1800)
         self.assertEqual(app.cf_direct_blocked_seconds(monitor), 0)
 
@@ -490,25 +496,42 @@ class CfDirectPauseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.cf_direct_failure_limit(), 5)
         self.assertEqual(app.cf_direct_block_seconds(), 60)
 
-    def test_first_rejection_does_not_pause(self):
+    def test_below_limit_does_not_pause(self):
         monitor = self._monitor()
-        app.record_cf_direct_rejection(monitor)
+        for _ in range(9):
+            app.record_cf_direct_rejection(monitor)
         self.assertEqual(app.cf_direct_blocked_seconds(monitor), 0)
 
-    def test_second_rejection_pauses_direct_fetch(self):
+    def test_rejection_count_is_returned(self):
         monitor = self._monitor()
-        app.record_cf_direct_rejection(monitor)
+        self.assertEqual(app.record_cf_direct_rejection(monitor), 1)
+        self.assertEqual(app.record_cf_direct_rejection(monitor), 2)
+
+    def test_limit_rejection_suppresses_the_warmup(self):
+        monitor = self._monitor()
+        for _ in range(9):
+            app.record_cf_direct_rejection(monitor)
         app.record_cf_direct_rejection(monitor)
         self.assertGreater(app.cf_direct_blocked_seconds(monitor), 1700)
 
     def test_success_clears_counter_and_pause(self):
         monitor = self._monitor()
-        app.record_cf_direct_rejection(monitor)
-        app.record_cf_direct_rejection(monitor)
+        for _ in range(10):
+            app.record_cf_direct_rejection(monitor)
         self.assertGreater(app.cf_direct_blocked_seconds(monitor), 0)
         app.record_cf_direct_success(monitor)
         self.assertEqual(app.cf_direct_blocked_seconds(monitor), 0)
         self.assertNotIn(app.cf_cache_key(monitor), app.cf_direct_failures)
+
+    def test_success_rearms_the_warning(self):
+        monitor = self._monitor()
+        for _ in range(10):
+            app.record_cf_direct_rejection(monitor)
+        self.assertTrue(app.cf_direct_alert_needed(monitor))
+        # While the outage lasts, the warning is not repeated.
+        self.assertFalse(app.cf_direct_alert_needed(monitor))
+        app.record_cf_direct_success(monitor)
+        self.assertTrue(app.cf_direct_alert_needed(monitor), "recovery must re-arm the warning")
 
     def test_zero_block_seconds_disables_pause(self):
         os.environ["CF_DIRECT_BLOCK_SECONDS"] = "0"
@@ -553,28 +576,37 @@ class CfDirectPauseTests(unittest.IsolatedAsyncioTestCase):
         orig = app.CurlAsyncSession
         app.CurlAsyncSession = lambda **kwargs: _Session()
         try:
-            for _ in range(2):
+            for _ in range(app.cf_direct_failure_limit()):
                 # Each rejection drops the cached session, so re-seed it.
                 _seed()
-                self.assertIsNone(await app.fetch_with_cf_cookies(monitor, 5))
+                result = await app.fetch_with_cf_cookies(monitor, 5)
+                # fetch_with_cf_cookies reports the outcome, it does not raise.
+                self.assertFalse(result.ok)
         finally:
             app.CurlAsyncSession = orig
         self.assertGreater(app.cf_direct_blocked_seconds(monitor), 0)
 
 
-class CfFetchUrlMirrorModeTests(unittest.IsolatedAsyncioTestCase):
-    """fetch_url must skip the direct path and its warmups while paused."""
+class CfDirectNoFallbackTests(unittest.IsolatedAsyncioTestCase):
+    """There is no browser mirror left: a rejection must raise, not load a page."""
 
     def setUp(self):
         app.cf_direct_failures.clear()
         app.cf_direct_block_until.clear()
+        app.cf_direct_alert_sent.clear()
         app.cf_cookie_cache.clear()
         app.cf_cookie_refresh_locks.clear()
         self.calls: list = []
+        self.notifications: list = []
+        self._env = dict(os.environ)
+        # The retry stage sleeps between same-clearance retries; a unit test must
+        # not, or a handful of failing fetches costs half a minute.
+        os.environ["CF_DIRECT_RETRY_DELAY_SECONDS"] = "0"
+        os.environ["CF_DIRECT_RETRY_COUNT"] = "1"
         self._orig = {
             "fetch_with_cf_cookies": app.fetch_with_cf_cookies,
             "refresh_cf_cookie_cache": app.refresh_cf_cookie_cache,
-            "fetch_via_cf_html": app.fetch_via_cf_html,
+            "send_gotify": app.send_gotify,
         }
 
     def tearDown(self):
@@ -582,8 +614,11 @@ class CfFetchUrlMirrorModeTests(unittest.IsolatedAsyncioTestCase):
             setattr(app, name, fn)
         app.cf_direct_failures.clear()
         app.cf_direct_block_until.clear()
+        app.cf_direct_alert_sent.clear()
         app.cf_cookie_cache.clear()
         app.cf_cookie_refresh_locks.clear()
+        os.environ.clear()
+        os.environ.update(self._env)
 
     def _monitor(self):
         return {
@@ -593,43 +628,208 @@ class CfFetchUrlMirrorModeTests(unittest.IsolatedAsyncioTestCase):
             "cf_bypass_url": "http://127.0.0.1:18001",
         }
 
-    def _install(self, *, direct=None, mirror="mirror-body"):
-        async def fake_direct(monitor, timeout):
+    def _install(self, *, direct=None):
+        from app import CfDirectResult
+
+        async def fake_direct(monitor, timeout, **kwargs):
             self.calls.append("direct")
-            return direct
+            if direct is None:
+                return CfDirectResult(None, "challenge")
+            return CfDirectResult(direct, "")
 
         async def fake_refresh(client, monitor, *, force=False):
             self.calls.append("refresh-force" if force else "refresh")
             return False
 
-        async def fake_mirror(client, monitor):
-            self.calls.append("mirror")
-            return mirror
+        async def fake_gotify(title, message):
+            self.notifications.append((title, message))
+            return True
 
         app.fetch_with_cf_cookies = fake_direct
         app.refresh_cf_cookie_cache = fake_refresh
-        app.fetch_via_cf_html = fake_mirror
+        app.send_gotify = fake_gotify
 
-    async def test_paused_monitor_goes_straight_to_mirror(self):
+    def test_browser_mirror_helper_is_gone(self):
+        # The /html fallback is removed, not merely unused.
+        self.assertFalse(hasattr(app, "fetch_via_cf_html"))
+
+    async def test_challenged_fetch_raises_instead_of_falling_back(self):
+        self._install()
+        with self.assertRaises(RuntimeError):
+            await app.fetch_url(None, self._monitor())
+        # Only the cheap cookie attempts and the (failed) warmup ran.
+        self.assertNotIn("mirror", self.calls)
+        self.assertIn("direct", self.calls)
+        self.assertIn("refresh-force", self.calls)
+
+    async def test_cooled_down_monitor_only_pays_for_the_cheap_attempt(self):
         monitor = self._monitor()
         app.cf_direct_block_until[app.cf_cache_key(monitor)] = time.time() + 600
         self._install()
-        self.assertEqual(await app.fetch_url(None, monitor), "mirror-body")
-        # No direct fetch and, crucially, no warmup at all.
-        self.assertEqual(self.calls, ["mirror"])
-
-    async def test_unpaused_monitor_still_tries_direct_first(self):
-        monitor = self._monitor()
-        self._install(direct="direct-body")
-        self.assertEqual(await app.fetch_url(None, monitor), "direct-body")
+        with self.assertRaises(RuntimeError):
+            await app.fetch_url(None, monitor)
+        # One direct attempt, and no headless-browser warmup at all.
         self.assertEqual(self.calls, ["direct"])
 
-    async def test_paused_monitor_falls_back_to_direct_when_mirror_fails(self):
+    async def test_cooled_down_monitor_recovers_on_the_cheap_attempt(self):
         monitor = self._monitor()
         app.cf_direct_block_until[app.cf_cache_key(monitor)] = time.time() + 600
-        self._install(direct="direct-body", mirror=None)
-        self.assertEqual(await app.fetch_url(None, monitor), "direct-body")
-        self.assertEqual(self.calls, ["mirror", "direct"])
+        app.cf_direct_failures[app.cf_cache_key(monitor)] = 10
+        self._install(direct="fresh-body")
+        self.assertEqual(await app.fetch_url(None, monitor), "fresh-body")
+        # Recovery clears the back-off so warmups may run again next time.
+        self.assertEqual(app.cf_direct_blocked_seconds(monitor), 0)
+
+    async def test_alert_is_sent_once_at_the_limit(self):
+        monitor = self._monitor()
+        os.environ["CF_DIRECT_FAILURE_LIMIT"] = "3"
+        self._install()
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                await app.fetch_url(None, monitor)
+        self.assertEqual(len(self.notifications), 1)
+        # The outage must not keep pushing on every subsequent failing tick.
+        with self.assertRaises(RuntimeError):
+            await app.fetch_url(None, monitor)
+        self.assertEqual(len(self.notifications), 1)
+        title, message = self.notifications[0]
+        self.assertIn("CF 直连失败", title)
+        self.assertIn("连续失败：3 次", message)
+        self.assertIn("linux.do", message)
+
+    async def test_no_alert_below_the_limit(self):
+        monitor = self._monitor()
+        os.environ["CF_DIRECT_FAILURE_LIMIT"] = "3"
+        self._install()
+        with self.assertRaises(RuntimeError):
+            await app.fetch_url(None, monitor)
+        self.assertEqual(self.notifications, [])
+
+    async def test_alert_is_rearmed_after_recovery(self):
+        monitor = self._monitor()
+        os.environ["CF_DIRECT_FAILURE_LIMIT"] = "3"
+        self._install()
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                await app.fetch_url(None, monitor)
+        self.assertEqual(len(self.notifications), 1)
+        # Recover, then fail again: the second outage must be reported too.
+        self._install(direct="fresh-body")
+        await app.fetch_url(None, monitor)
+        self._install()
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                await app.fetch_url(None, monitor)
+        self.assertEqual(len(self.notifications), 2)
+
+
+class CfClientHintsTests(unittest.TestCase):
+    """A zone with `critical-ch` set rejects clients that send no Client Hints."""
+
+    def test_firefox_presets_get_hints(self):
+        for preset in ("firefox133", "firefox135", "firefox147"):
+            with self.subTest(preset=preset):
+                headers = app.cf_client_hint_headers(preset)
+                self.assertIn("sec-ch-ua", headers)
+                self.assertIn("sec-ch-ua-full-version-list", headers)
+                self.assertFalse(app.cf_preset_sends_client_hints(preset))
+
+    def test_non_firefox_presets_keep_their_own_hints(self):
+        for preset in ("chrome124", "chrome136", "edge101", "brave132"):
+            with self.subTest(preset=preset):
+                self.assertEqual(app.cf_client_hint_headers(preset), {})
+                self.assertTrue(app.cf_preset_sends_client_hints(preset))
+
+    def test_non_chromium_presets_get_hints(self):
+        # Tor Browser is Firefox-based and Safari sends none of these either, so
+        # silence would earn them the same challenge.
+        for preset in ("tor145", "safari184", "safari180"):
+            with self.subTest(preset=preset):
+                self.assertTrue(app.cf_client_hint_headers(preset))
+                self.assertFalse(app.cf_preset_sends_client_hints(preset))
+
+    def test_every_critical_hint_the_zone_asks_for_is_present(self):
+        # Taken verbatim from the `critical-ch` header Cloudflare sends for
+        # linux.do. A missing one is enough to earn a managed challenge.
+        required = {
+            "sec-ch-ua-bitness", "sec-ch-ua-arch", "sec-ch-ua-full-version",
+            "sec-ch-ua-mobile", "sec-ch-ua-model", "sec-ch-ua-platform-version",
+            "sec-ch-ua-full-version-list", "sec-ch-ua-platform", "sec-ch-ua",
+        }
+        headers = app.cf_client_hint_headers("firefox133")
+        # `model` is desktop-empty (?0-style omission) and is intentionally not
+        # sent; everything else must be there.
+        self.assertTrue((required - {"sec-ch-ua-model"}) <= set(headers))
+
+    def test_candidates_span_families_and_keep_order(self):
+        monitor = {"name": "m", "cf_impersonate": "firefox133"}
+        candidates = app.cf_impersonate_candidates(monitor, "")
+        self.assertEqual(candidates[0], "firefox133", "per-monitor value wins")
+        self.assertEqual(len(candidates), len(set(candidates)), "no duplicates")
+        families = {c.split("1")[0].rstrip("0123456789") for c in candidates}
+        self.assertIn("safari", families)
+        self.assertIn("chrome", families)
+        self.assertIn("firefox", families)
+
+    def test_worker_agent_ua_is_not_first(self):
+        # The UA-derived guess is a known-bad fingerprint; it must never lead.
+        monitor = {}
+        candidates = app.cf_impersonate_candidates(monitor, "Mozilla/5.0 Firefox/143.0")
+        self.assertEqual(candidates[0], app.CAMOUFOX_IMPERSONATE)
+
+    def test_every_trusted_preset_is_offered_as_a_candidate(self):
+        candidates = app.cf_impersonate_candidates({}, "")
+        for preset in app.KNOWN_GOOD_IMPERSONATES:
+            with self.subTest(preset=preset):
+                self.assertIn(preset, candidates)
+
+    async def test_direct_fetch_sends_hints_for_firefox(self):
+        monitor = {
+            "name": "m",
+            "url": "https://linux.do/c/welfare/36.json",
+            "cf_bypass": True,
+            "cf_bypass_url": "http://127.0.0.1:18001",
+        }
+        app.cf_cookie_cache[app.cf_cache_key(monitor)] = {
+            "cookies": {"cf_clearance": "x"},
+            "user_agent": "UA/1",
+            "expires_at": None,
+        }
+        seen: list = []
+
+        class _Ok:
+            status_code = 200
+            text = '{"topic_list": {"topics": [{"id": 1}]}}'
+            headers: dict = {}
+
+            def raise_for_status(self):
+                return None
+
+        class _Session:
+            def __init__(self, **kwargs):
+                seen.append(kwargs)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return _Ok()
+
+        orig = app.CurlAsyncSession
+        app.CurlAsyncSession = lambda **kwargs: _Session(**kwargs)
+        try:
+            result = await app.fetch_with_cf_cookies(monitor, 5)
+        finally:
+            app.CurlAsyncSession = orig
+            app.cf_cookie_cache.clear()
+        self.assertTrue(result.ok)
+        self.assertTrue(seen, "a session must have been built")
+        headers = seen[0].get("headers") or {}
+        self.assertIn("sec-ch-ua", headers)
+        self.assertIn("sec-ch-ua-platform", headers)
 
 
 if __name__ == "__main__":

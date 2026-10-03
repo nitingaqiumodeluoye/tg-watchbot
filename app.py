@@ -96,6 +96,40 @@ LINUXDO_LOGIN_TOPIC_KEYS = {
 # 403 6/6 times. Override per monitor with `cf_impersonate: <name>` in config.yaml.
 CAMOUFOX_IMPERSONATE = "firefox133"
 
+# Cloudflare advertises Critical Client Hints on the linux.do zones (the challenge
+# response carries `critical-ch: Sec-CH-UA-Bitness, Sec-CH-UA-Arch, ...`), and a
+# client that stays silent is handed a managed challenge however fresh its
+# cf_clearance is. curl_cffi's Firefox presets send no Client Hints at all (Firefox
+# does not implement them), which is why every direct fetch started 403ing on
+# 2026-10-03 ~15:27. Measured with the same warmed session on
+# https://linux.do/c/welfare/36.json:
+#   firefox133                -> 403, cf-mitigated=challenge
+#   firefox133 + Sec-CH-UA-*  -> 200
+#   latest.rss                -> 200 either way (that path is not challenged)
+# So Client Hints are attached by hand for presets that cannot emit them, and the
+# fingerprint candidates span families so a preset that emits its own hints is
+# also tried.
+_CLIENT_HINT_HEADERS = {
+    "sec-ch-ua": '"Chromium";v="142", "Not_A Brand";v="24", "Google Chrome";v="142"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Linux"',
+    "sec-ch-ua-platform-version": '"6.8.0"',
+    "sec-ch-ua-arch": '"x86_64"',
+    "sec-ch-ua-bitness": '"64"',
+    "sec-ch-ua-full-version": '"142.0.7444.60"',
+    "sec-ch-ua-full-version-list": (
+        '"Chromium";v="142.0.7444.60", "Not_A Brand";v="24.0.0.0", '
+        '"Google Chrome";v="142.0.7444.60"'
+    ),
+}
+
+# Presets to consider beyond the camoufox one, spanning families because that is
+# what decides whether Client Hints are emitted natively.
+_IMPERSONATE_EXTRA_CANDIDATES = (
+    "firefox133", "firefox135", "firefox147", "safari184", "safari180",
+    "chrome124", "chrome136", "chrome145",
+)
+
 
 def telegram_proxy_url() -> str | None:
     for key in ("TELEGRAM_PROXY_URL", "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
@@ -167,6 +201,9 @@ cf_cookie_refresh_locks: dict[str, asyncio.Lock] = {}
 # direct path can be paused in favour of the browser mirror.
 cf_direct_failures: dict[str, int] = {}
 cf_direct_block_until: dict[str, float] = {}
+# Cache keys whose Cloudflare outage has already been reported, so the warning is
+# sent once per outage instead of once per failing tick.
+cf_direct_alert_sent: dict[str, bool] = {}
 DEFAULT_CF_DIRECT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
 
 
@@ -2650,12 +2687,17 @@ def cf_refresh_timeout_seconds(monitor: dict[str, Any]) -> int:
 
 
 def cf_direct_failure_limit() -> int:
-    """Consecutive direct-fetch rejections before mirror-only mode kicks in."""
-    return max(1, safe_int(os.getenv("CF_DIRECT_FAILURE_LIMIT"), 2))
+    """Consecutive direct-fetch rejections before backing off and warning.
+
+    Also the number of failures the operator is warned about: this path no longer
+    falls back to a browser mirror, so an outage has to be reported rather than
+    papered over. Ten consecutive minutes of a 60s monitor is a real outage.
+    """
+    return max(1, safe_int(os.getenv("CF_DIRECT_FAILURE_LIMIT"), 10))
 
 
 def cf_direct_block_seconds() -> int:
-    """How long mirror-only mode lasts after the direct path proves hopeless."""
+    """How long the expensive warmup is suppressed after too many rejections."""
     return max(0, safe_int(os.getenv("CF_DIRECT_BLOCK_SECONDS"), 1800))
 
 
@@ -2677,44 +2719,86 @@ def cf_direct_retry_delay_seconds() -> float:
 
 
 def cf_direct_blocked_seconds(monitor: dict[str, Any]) -> float:
-    """Remaining mirror-only seconds (0 when the direct path is allowed)."""
+    """Remaining warmup-suppression seconds (0 when warmups are allowed again)."""
     remaining = cf_direct_block_until.get(cf_cache_key(monitor), 0.0) - time.time()
     return remaining if remaining > 0 else 0.0
 
 
-def record_cf_direct_rejection(monitor: dict[str, Any]) -> None:
-    """Count a Cloudflare rejection of the direct fetch, pausing it once hopeless.
+def record_cf_direct_rejection(monitor: dict[str, Any]) -> int:
+    """Count a Cloudflare rejection of the direct fetch and back off the warmup.
 
     When the direct fetch is challenged right after a warmup, the cached
-    cf_clearance is not what Cloudflare objects to: it is challenging the
-    curl_cffi request fingerprint (or the egress IP). Every further direct
-    attempt costs another 30-90s warmup before the browser mirror runs anyway,
-    so after ``CF_DIRECT_FAILURE_LIMIT`` consecutive rejections the direct path
-    is skipped for ``CF_DIRECT_BLOCK_SECONDS`` in favour of the mirror.
+    cf_clearance is not what Cloudflare objects to: it is challenging the request
+    fingerprint, the missing Client Hints, or the egress IP. Every further direct
+    attempt would pay another headless-browser challenge, so after
+    ``CF_DIRECT_FAILURE_LIMIT`` consecutive rejections the warmup is suppressed for
+    ``CF_DIRECT_BLOCK_SECONDS``. The cheap cached-session attempt still runs on
+    every tick, which is how recovery is noticed without any browser cost.
+
+    Returns the new consecutive-rejection count.
     """
     key = cf_cache_key(monitor)
     failures = cf_direct_failures.get(key, 0) + 1
     cf_direct_failures[key] = failures
     if failures < cf_direct_failure_limit():
-        return
+        return failures
     seconds = cf_direct_block_seconds()
     if seconds <= 0:
-        return
+        return failures
     cf_direct_block_until[key] = time.time() + seconds
     logger.warning(
-        "cf direct fetch paused monitor=%s rejections=%s pause_seconds=%s reason=clearance_ignored",
+        "cf direct fetch backing off monitor=%s rejections=%s warmup_suppressed_for=%ss",
         monitor.get("name"), failures, seconds,
+    )
+    return failures
+
+
+def cf_direct_alert_needed(monitor: dict[str, Any]) -> bool:
+    """Whether this CF outage still needs to be reported (once per outage)."""
+    key = cf_cache_key(monitor)
+    if cf_direct_alert_sent.get(key):
+        return False
+    cf_direct_alert_sent[key] = True
+    return True
+
+
+async def notify_cf_direct_failure(
+    monitor: dict[str, Any], failures: int, reason: str
+) -> None:
+    """Warn on Gotify that the direct Cloudflare path is down.
+
+    This is the replacement for the removed browser mirror: instead of silently
+    loading every page through a headless browser (which solved a challenge a
+    minute and made the rate limiting worse), the outage is reported and the
+    monitor's own failure alert covers Telegram. Sent once per outage, at the
+    ``CF_DIRECT_FAILURE_LIMIT``-th consecutive rejection.
+    """
+    if failures < cf_direct_failure_limit():
+        return
+    name = str(monitor.get("name") or "unnamed")
+    if not cf_direct_alert_needed(monitor):
+        return
+    await send_gotify(
+        f"CF 直连失败：{name}",
+        "Cloudflare 直连持续失败，已不再浏览器回退并暂停预热\n"
+        f"监控：{name}\n"
+        f"URL：{monitor.get('url') or '-'}\n"
+        f"连续失败：{failures} 次\n"
+        f"原因：{reason or 'unknown'}\n"
+        f"指纹：{', '.join(cf_impersonate_candidates(monitor, ''))}\n"
+        f"时间：{now_iso()}",
     )
 
 
 def record_cf_direct_success(monitor: dict[str, Any]) -> None:
-    """Reset the rejection counter and leave mirror-only mode."""
+    """Reset the rejection counter, leave the back-off, and allow a new warning."""
     key = cf_cache_key(monitor)
     # Pop both explicitly: `a.pop() or b.pop()` would short-circuit and leave the
     # pause in place whenever the failure counter is non-empty.
     failures = cf_direct_failures.pop(key, None)
     paused = cf_direct_block_until.pop(key, None)
-    if failures or paused:
+    alerted = cf_direct_alert_sent.pop(key, None)
+    if failures or paused or alerted:
         logger.info("cf direct fetch recovered monitor=%s", monitor.get("name"))
 
 
@@ -2808,20 +2892,42 @@ def cf_impersonate_for_user_agent(user_agent: str) -> str:
     return "firefox"
 
 
+# Presets that emit their own Client Hints: Chromium-family browsers do, and
+# sending ours on top would contradict the version their TLS fingerprint claims.
+# Everything else (Firefox, Tor, Safari, anything unknown) gets the headers
+# attached by hand rather than staying silent and being challenged.
+_CLIENT_HINT_NATIVE_PREFIXES = ("chrome", "chromium", "edge", "brave", "opera", "vivaldi", "unbranded")
+
+
+def cf_preset_sends_client_hints(impersonate: str) -> bool:
+    """Whether curl_cffi already sends Client Hints for this preset."""
+    return str(impersonate).lower().startswith(_CLIENT_HINT_NATIVE_PREFIXES)
+
+
+def cf_client_hint_headers(impersonate: str) -> dict[str, str]:
+    """Client Hints to send for ``impersonate``, or nothing when it sends its own."""
+    return {} if cf_preset_sends_client_hints(impersonate) else dict(_CLIENT_HINT_HEADERS)
+
+
 def cf_impersonate_candidates(monitor: dict[str, Any], user_agent: str) -> list[str]:
     """Ordered curl_cffi impersonations to try for a bypass-issued session.
 
     Only the bypass browser can obtain cf_clearance, and Cloudflare validates that
     clearance against the client fingerprint, so the impersonation must match the
     browser rather than the User-Agent it happens to report. The known-good
-    camoufox fingerprint is tried first, then the UA-derived guess; a per-monitor
-    ``cf_impersonate`` wins over both.
+    camoufox fingerprint is tried first, then the UA-derived guess, then the wider
+    family list; a per-monitor ``cf_impersonate`` wins over all of them.
+
+    The wider list matters because the fingerprint also decides whether Client
+    Hints are emitted: a Firefox-only list can never satisfy a zone that turned
+    ``critical-ch`` on, no matter which Firefox version is tried.
     """
     candidates: list[str] = []
     for value in (
         str(monitor.get("cf_impersonate") or "").strip(),
         CAMOUFOX_IMPERSONATE,
         cf_impersonate_for_user_agent(user_agent),
+        *_IMPERSONATE_EXTRA_CANDIDATES,
     ):
         if value and value not in candidates:
             candidates.append(value)
@@ -2829,11 +2935,20 @@ def cf_impersonate_candidates(monitor: dict[str, Any], user_agent: str) -> list[
 
 
 # Impersonations actually expected to pass Cloudflare for the camoufox sessions
-# this service hands out. `remembered` is only trusted when it is in here, so a
-# UA-derived guess can never pin the direct path to a rejected fingerprint (which
-# used to burn two rejections per warmup and lock a monitor into mirror-only mode
-# for 30 minutes at a time).
-KNOWN_GOOD_IMPERSONATES = (CAMOUFOX_IMPERSONATE,)
+# this service hands out. A UA-derived guess is not trusted here, so a monitor
+# cannot pin its direct path to a fingerprint Cloudflare never accepted; the
+# families that emit Client Hints are trusted too, because a zone with
+# `critical-ch` set rejects every Firefox preset outright.
+KNOWN_GOOD_IMPERSONATES = (
+    CAMOUFOX_IMPERSONATE,
+    "firefox135",
+    "firefox147",
+    "safari184",
+    "safari180",
+    "chrome124",
+    "chrome136",
+    "chrome145",
+)
 
 
 def cf_remembered_impersonate(cached: dict[str, Any]) -> str:
@@ -3157,10 +3272,9 @@ async def fetch_with_cf_cookies(
     ``count_rejection=False`` is used for the retries inside a single
     ``fetch_url`` call: one logical fetch can burn through several fingerprints
     and both warmup stages, and counting each as an independent rejection used
-    to trip the ``CF_DIRECT_FAILURE_LIMIT`` pause *before* the ``force=True``
-    warmup (the only one that actually mints a fresh session) ever ran, leaving
-    the monitor stuck in mirror-only mode. Only the final outcome of a fetch
-    should count.
+    to trip the ``CF_DIRECT_FAILURE_LIMIT`` back-off *before* the ``force=True``
+    warmup (the only one that actually mints a fresh session) ever ran. Only the
+    final outcome of a fetch should count.
 
     ``drop_cache_on_failure=False`` keeps the cached session so a transient
     rate-limit 403 can be retried with the same clearance instead of throwing
@@ -3191,7 +3305,11 @@ async def fetch_with_cf_cookies(
     last_reason: str = ""
     for impersonate in candidates:
         try:
-            async with CurlAsyncSession(impersonate=impersonate, headers=headers, timeout=timeout) as session:
+            # Firefox presets send no Client Hints, and a zone with `critical-ch`
+            # set challenges any client that stays silent regardless of how fresh
+            # the clearance is, so the hints are attached for those presets.
+            attempt_headers = {**headers, **cf_client_hint_headers(impersonate)}
+            async with CurlAsyncSession(impersonate=impersonate, headers=attempt_headers, timeout=timeout) as session:
                 response = await session.get(target_url, cookies=cached["cookies"], proxy=proxy_url, allow_redirects=True)
             body = response.text
             reason = cf_challenge_reason(int(response.status_code), body, response.headers)
@@ -3233,69 +3351,40 @@ async def fetch_with_cf_cookies(
     return CfDirectResult(None, last_reason or "unknown")
 
 
-async def fetch_via_cf_html(client: httpx.AsyncClient, monitor: dict[str, Any]) -> str | None:
-    """Last-resort cf_bypass fetch: let the bypass browser load the page itself.
-
-    Used when the cookie-cache direct fetch keeps getting challenged (cf_clearance
-    unavailable). The configured cf_cookies (e.g. the linux.do _t login cookie)
-    are forwarded so the bypass browser session stays logged in; a JSON target is
-    returned as <pre>-wrapped text that normalize_json_body already handles.
-    """
-    base_url = _require_cf_bypass_base_url(monitor)
-    target_url = str(monitor.get("url") or "").strip()
-    if not target_url:
-        return None
-    endpoint = f"{base_url}/html?{urlencode({'url': target_url})}"
-    configured_cookies = cf_configured_cookies(monitor)
-    headers = {"Cookie": cookie_header(configured_cookies)} if configured_cookies else {}
-    timeout = cf_refresh_timeout_seconds(monitor)
-    try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as html_client:
-            response = await html_client.get(endpoint, headers=headers, follow_redirects=True)
-            response.raise_for_status()
-            body = response.text
-    except Exception as e:
-        logger.warning("cf html fallback failed monitor=%s error=%s", monitor.get("name"), e)
-        return None
-    if not body or not body.strip():
-        return None
-    html_reason = cf_challenge_reason(200, body)
-    if html_reason:
-        logger.info("cf html fallback still challenged monitor=%s reason=%s", monitor.get("name"), html_reason)
-        return None
-    logger.info("cf html fallback ok monitor=%s chars=%s", monitor.get("name"), len(body))
-    return body
-
-
 async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | str) -> str:
     if isinstance(monitor_or_url, dict) and monitor_or_url.get("cf_bypass"):
         monitor = monitor_or_url
         _require_cf_bypass_base_url(monitor)
         timeout = _cf_fetch_timeout(client)
-        paused_for = cf_direct_blocked_seconds(monitor)
-        if paused_for > 0:
-            # Consecutive Cloudflare rejections already proved that a fresh
-            # clearance does not make the direct fetch work, so skip the direct
-            # path and its 30-90s warmups: let the bypass browser load it.
-            logger.info(
-                "cf mirror mode monitor=%s direct_paused_for=%ss",
-                monitor.get("name"), int(paused_for),
-            )
-            html_body = await fetch_via_cf_html(client, monitor)
-            if html_body is not None:
-                return html_body
-            logger.warning("cf mirror fetch failed monitor=%s, retrying cookie path", monitor.get("name"))
-        # A 403/429 does not prove the clearance is dead: Cloudflare serves the
-        # same status for short-lived per-IP rate limiting, and the very same
-        # session succeeds seconds later. Retry with the cached session first
-        # (~0.4s) instead of immediately paying 43-72s for a headless browser
-        # challenge, which also aggravates the rate limiting that caused it.
+        cooling_down = cf_direct_blocked_seconds(monitor) > 0
+        # The cheap attempt runs on every tick, including while cooled down. A
+        # 403/429 does not prove the clearance is dead: Cloudflare serves the same
+        # status for short-lived per-IP rate limiting, and the very same session
+        # succeeds seconds later. Retrying with the cached session first (~0.4s)
+        # instead of immediately paying 43-72s for a headless browser challenge
+        # also stops aggravating the rate limiting that caused it.
         direct_result = await fetch_with_cf_cookies(
             monitor, timeout, count_rejection=False, drop_cache_on_failure=False
         )
         if direct_result.ok:
+            record_cf_direct_success(monitor)
             return direct_result.body
         reason = direct_result.reason
+        if cooling_down:
+            # Too many consecutive rejections: skip the browser warmup rather than
+            # pay it again for a request Cloudflare has made clear it will not
+            # accept. Nothing falls back to a browser mirror any more, so the
+            # outage is reported instead of hidden.
+            failures = cf_direct_failures.get(cf_cache_key(monitor), 0)
+            logger.info(
+                "cf direct cooling down monitor=%s reason=%s rejections=%s remaining=%ss",
+                monitor.get("name"), reason or "unknown", failures,
+                int(cf_direct_blocked_seconds(monitor)),
+            )
+            await notify_cf_direct_failure(monitor, failures, reason)
+            raise RuntimeError(
+                f"cf logged-in fetch failed for monitor {monitor.get('name')!r} reason={reason or 'unknown'}"
+            )
         # ``blocked`` (bot-management / rate-limit page) and ``origin`` (bad
         # upstream response) cannot be fixed by a fresh cf_clearance, so the
         # 43-72s browser challenge is skipped entirely for those.
@@ -3320,6 +3409,7 @@ async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | 
                             "cf direct fetch recovered on retry monitor=%s attempt=%s",
                             monitor.get("name"), attempt,
                         )
+                        record_cf_direct_success(monitor)
                         return retry_result.body
                     reason = retry_result.reason
                     if reason == "no_session":
@@ -3348,13 +3438,15 @@ async def fetch_url(client: httpx.AsyncClient, monitor_or_url: dict[str, Any] | 
                 if direct_result.ok:
                     record_cf_direct_success(monitor)
                     return direct_result.body
-        html_body = await fetch_via_cf_html(client, monitor)
-        if html_body is not None:
-            return html_body
         # Exactly one rejection per failed logical fetch, recorded only after
-        # every stage (including the force=True warmup) has been exhausted.
-        record_cf_direct_rejection(monitor)
-        raise RuntimeError(f"cf logged-in fetch failed for monitor {monitor.get('name')!r}")
+        # every stage (including the force=True warmup) has been exhausted. At the
+        # limit the warmup is suppressed for a while and the operator is warned;
+        # there is deliberately no browser mirror to fall back to.
+        failures = record_cf_direct_rejection(monitor)
+        await notify_cf_direct_failure(monitor, failures, reason)
+        raise RuntimeError(
+            f"cf logged-in fetch failed for monitor {monitor.get('name')!r} reason={reason or 'unknown'}"
+        )
     url = monitor_fetch_url(monitor_or_url) if isinstance(monitor_or_url, dict) else str(monitor_or_url)
     headers = None
     if isinstance(monitor_or_url, dict):
