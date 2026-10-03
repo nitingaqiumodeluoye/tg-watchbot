@@ -52,10 +52,10 @@ def namespace():
         'CDK_BASE': 'https://cdk.example',
         'project_id_from_link': lambda link: str(link).rstrip('/').split('/')[-1],
         '_clearance_cache': {'cookies': {}, 'user_agent': ''},
-        '_probe_state': {'last_probe_at': 0.0, 'url': '', 'verified': False},
+        '_probe_state': {'last_probe_at': 0.0, 'url': '', 'verified': False, 'project_id': ''},
         '_probe_url_loaded': True,
-        '_load_persisted_probe_url': lambda: '',
-        '_persist_probe_url': lambda url: None,
+        '_load_persisted_probe_state': lambda: {},
+        '_persist_probe_state': lambda **kw: None,
         'cdk_clearance_probe_seconds': lambda: 600,
         'load_cdk_session': lambda **kw: SimpleNamespace(ok=False),
         'verify_clearance': Mock(return_value=True),
@@ -72,12 +72,13 @@ def force_flags(ns):
 class ValidationTests(unittest.TestCase):
     """verify_clearance must only bless a response Cloudflare actually served."""
 
-    def test_only_accepted_2xx_counts(self):
+    def test_only_origin_accepted_responses_count(self):
         cases = [
             (200, '', '', True), (204, '', '', True),
+            (404, '', '', True),  # reached the origin: clearance was accepted
             (403, 'challenge', '', False), (200, 'challenge', '', False),
             (403, '', 'Just a moment', False), (401, '', '', False),
-            (404, '', '', False), (429, '', '', False), (503, '', '', False),
+            (403, '', '', False), (429, '', '', False), (503, '', '', False),
         ]
         for status, header, body, expected in cases:
             with self.subTest(status=status, header=header):
@@ -183,15 +184,40 @@ class RefreshTests(unittest.TestCase):
             ns['verify_clearance'].call_args.args[3],
         )
 
-    def test_probe_targets(self):
+    def test_probe_target_prefers_the_project_api(self):
         ns = namespace()
+        # Nothing remembered yet: the warmup page is the only safe target.
         self.assertEqual('https://cdk.example/dashboard', ns['clearance_probe_url']())
-        ns['remember_cdk_link']('https://cdk.example/receive/abc')
-        self.assertEqual('https://cdk.example/receive/abc', ns['clearance_probe_url']())
         self.assertEqual(
             'https://cdk.example/api/v1/projects/abc', ns['claim_probe_url']('abc')
         )
         self.assertEqual('', ns['claim_probe_url'](''))
+        ns['remember_cdk_link']('https://cdk.example/receive/abc-def')
+        # The periodic probe must target the same request a claim makes.
+        self.assertEqual(
+            'https://cdk.example/api/v1/projects/abc-def', ns['clearance_probe_url']()
+        )
+        self.assertEqual('https://cdk.example/receive/abc-def', ns['_probe_state']['url'])
+
+    def test_persisted_state_is_reloaded_after_restart(self):
+        ns = namespace()
+        ns['_probe_url_loaded'] = False
+        ns['_load_persisted_probe_state'] = lambda: {
+            'probe_project_id': 'from-disk', 'probe_url': 'https://cdk.example/receive/from-disk'
+        }
+        self.assertEqual(
+            'https://cdk.example/api/v1/projects/from-disk', ns['clearance_probe_url']()
+        )
+
+    def test_remembered_link_is_persisted(self):
+        ns = namespace()
+        saved = {}
+        ns['_persist_probe_state'] = lambda **kw: saved.update(kw)
+        ns['remember_cdk_link']('https://cdk.example/receive/keep-me')
+        self.assertEqual(
+            {'probe_project_id': 'keep-me', 'probe_url': 'https://cdk.example/receive/keep-me'},
+            saved,
+        )
 
 
 if __name__ == '__main__':

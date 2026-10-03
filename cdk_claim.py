@@ -310,8 +310,12 @@ _clearance_cache: dict[str, Any] = {"cookies": {}, "user_agent": ""}
 # Probe bookkeeping. The clearance has no TTL: like the monitor's cf session it is
 # kept until Cloudflare stops accepting it. ``verified`` records the outcome of
 # the last validation, so a caller can tell "we hold a cookie" apart from
-# "Cloudflare accepted it".
-_probe_state: dict[str, Any] = {"last_probe_at": 0.0, "url": "", "verified": False}
+# "Cloudflare accepted it". ``project_id`` is the most recent give-away and is
+# what the periodic probe targets, because the project API -- not the page -- is
+# the request a claim has to pass.
+_probe_state: dict[str, Any] = {
+    "last_probe_at": 0.0, "url": "", "verified": False, "project_id": "",
+}
 _probe_url_loaded = False
 
 
@@ -319,7 +323,7 @@ def _probe_state_db() -> str:
     return os.getenv("CDK_STATE_DB", "/app/tg-watchbot.sqlite3").strip()
 
 
-def _load_persisted_probe_url() -> str:
+def _load_persisted_probe_state() -> dict[str, str]:
     """Read back the last give-away probe target so a restart is not blind.
 
     Kept in the monitor's sqlite file because that is the one path docker-compose
@@ -328,16 +332,18 @@ def _load_persisted_probe_url() -> str:
     """
     try:
         with sqlite3.connect(f"file:{_probe_state_db()}?mode=ro", uri=True) as conn:
-            row = conn.execute(
-                "SELECT value FROM cdk_probe_state WHERE key='probe_url'"
-            ).fetchone()
-        return str(row[0]) if row and row[0] else ""
+            rows = conn.execute(
+                "SELECT key, value FROM cdk_probe_state "
+                "WHERE key IN ('probe_url', 'probe_project_id')"
+            ).fetchall()
+        return {str(k): str(v) for k, v in rows if v}
     except Exception:
-        return ""
+        return {}
 
 
-def _persist_probe_url(url: str) -> None:
-    if not url:
+def _persist_probe_state(**values: str) -> None:
+    values = {k: v for k, v in values.items() if v}
+    if not values:
         return
     try:
         with sqlite3.connect(_probe_state_db()) as conn:
@@ -345,14 +351,14 @@ def _persist_probe_url(url: str) -> None:
                 "CREATE TABLE IF NOT EXISTS cdk_probe_state ("
                 "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
-            conn.execute(
-                "INSERT INTO cdk_probe_state(key, value) VALUES('probe_url', ?) "
+            conn.executemany(
+                "INSERT INTO cdk_probe_state(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (url,),
+                list(values.items()),
             )
             conn.commit()
     except Exception as exc:
-        logger.debug("cdk probe url persist failed: %s", type(exc).__name__)
+        logger.debug("cdk probe state persist failed: %s", type(exc).__name__)
 
 
 def cdk_clearance_probe_seconds() -> float:
@@ -361,41 +367,51 @@ def cdk_clearance_probe_seconds() -> float:
 
 
 def remember_cdk_link(link: str) -> None:
-    """Remember the most recent give-away link, which becomes the probe target.
+    """Remember the most recent give-away, which becomes the probe target.
 
-    Probing a give-away URL is both the most faithful check -- it is exactly
-    what a claim requests -- and the most stable one. Measured over five
-    back-to-back probes each: the site root was challenged 2/5 times and
-    /api/v1/oauth/user-info is challenged intermittently, while
-    /receive/<id> answered 200 on every probe.
+    The project API is what a claim needs to reach, so that is what gets probed;
+    the page URL is kept as a fallback for when no project id is known.
     """
     project_id = project_id_from_link(link)
     if project_id:
+        _probe_state["project_id"] = project_id
         _probe_state["url"] = f"{CDK_BASE}/receive/{project_id}"
-        _persist_probe_url(_probe_state["url"])
+        _persist_probe_state(
+            probe_project_id=project_id, probe_url=_probe_state["url"]
+        )
 
 
 def claim_probe_url(project_id: str) -> str:
-    """The URL a clearance is validated against before claiming ``project_id``.
+    """The URL a clearance must pass for ``project_id``.
 
-    Validation has to target something the claim itself needs to reach. A page
-    probe can pass while the project API is challenged, which is exactly how a
-    "healthy" clearance still produced a Cloudflare failure mid-claim.
+    This is deliberately the API a claim calls, not the /receive page: a page
+    probe can answer 200 while the project API returns `cf-mitigated: challenge`,
+    so probing the page reported a warm clearance that then failed mid-claim.
     """
     return f"{CDK_BASE}/api/v1/projects/{project_id}" if project_id else ""
 
 
 def clearance_probe_url() -> str:
-    """The URL a cached clearance is probed against.
+    """The URL the periodic probe validates the cached clearance against.
 
-    Falls back to the warmup page until a give-away has been seen, so the very
-    first claim after a restart still has something valid to check against.
+    Prefers the project API of the most recent give-away, because that is the
+    request a claim actually has to pass; probing the /receive page reported
+    healthy while the API answered `cf-mitigated: challenge`, which is how a
+    rejected clearance still looked warm. Falls back to the give-away page, then
+    to the warmup page, so the first probe after a restart still has a target.
     """
     global _probe_url_loaded
     if not _probe_url_loaded:
         _probe_url_loaded = True
-        if not _probe_state.get("url"):
-            _probe_state["url"] = _load_persisted_probe_url()
+        if not _probe_state.get("url") or not _probe_state.get("project_id"):
+            saved = _load_persisted_probe_state()
+            if not _probe_state.get("url"):
+                _probe_state["url"] = saved.get("probe_url", "")
+            if not _probe_state.get("project_id"):
+                _probe_state["project_id"] = saved.get("probe_project_id", "")
+    api = claim_probe_url(str(_probe_state.get("project_id") or ""))
+    if api:
+        return api
     return str(_probe_state.get("url") or "") or f"{CDK_BASE}/dashboard"
 
 
@@ -431,8 +447,12 @@ def verify_clearance(
         )
         mitigated = str(resp.headers.get("cf-mitigated", "")).strip().lower()
         challenged = mitigated == "challenge" or _challenge_like(resp)
-        # A rejected or unavailable endpoint is not evidence of good health.
-        verified = not challenged and 200 <= resp.status_code < 300
+        # Cloudflare accepted the session when the request reached the origin:
+        # 2xx answers do, and a 404 (an expired give-away) does too. 401/403/429
+        # and 5xx prove nothing, so they must never count as healthy.
+        verified = not challenged and (
+            200 <= resp.status_code < 300 or resp.status_code == 404
+        )
         logger.log(
             logging.INFO if verified else logging.WARNING,
             "cdk clearance validation url=%s status=%s cf_mitigated=%s challenge=%s verified=%s",
