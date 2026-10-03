@@ -220,6 +220,39 @@ class RefreshTests(unittest.TestCase):
             'https://cdk.example/api/v1/projects/legacy-id', ns['clearance_probe_url']()
         )
 
+    def test_mint_targets_the_same_url_it_validates(self):
+        """Cloudflare challenges per path, so the browser must load the claim URL."""
+        ns = namespace()
+        ns['cached_clearance'](
+            session_id='sid', probe_url='https://cdk.example/api/v1/projects/abc', force=True
+        )
+        self.assertEqual(
+            'https://cdk.example/api/v1/projects/abc',
+            ns['fetch_cdk_clearance'].call_args.kwargs['target_url'],
+        )
+
+    def test_mint_target_follows_the_periodic_probe(self):
+        ns = namespace()
+        ns['remember_cdk_link']('https://cdk.example/receive/api-id')
+        ns['refresh_clearance_if_stale']()
+        self.assertEqual(
+            'https://cdk.example/api/v1/projects/api-id',
+            ns['fetch_cdk_clearance'].call_args.kwargs['target_url'],
+        )
+
+    def test_mint_target_is_the_warmup_page_when_nothing_is_known(self):
+        # With no give-away seen yet, both the probe and the browser fall back to
+        # /dashboard; the important part is that they agree.
+        ns = namespace()
+        ns['refresh_clearance_if_stale']()
+        self.assertEqual(
+            'https://cdk.example/dashboard',
+            ns['fetch_cdk_clearance'].call_args.kwargs['target_url'],
+        )
+        self.assertEqual(
+            ns['clearance_probe_url'](), ns['fetch_cdk_clearance'].call_args.kwargs['target_url']
+        )
+
     def test_remembered_link_is_persisted(self):
         ns = namespace()
         saved = {}

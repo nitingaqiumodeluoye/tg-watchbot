@@ -281,15 +281,24 @@ def cf_bypass_url() -> str:
     ).rstrip("/")
 
 
-def fetch_cdk_clearance(*, force: bool = False, timeout: int = 150) -> tuple[dict[str, str], str]:
-    """Ask the bypass browser for a cdk.linux.do cookie jar.
+def fetch_cdk_clearance(
+    *, force: bool = False, timeout: int = 150, target_url: str = ""
+) -> tuple[dict[str, str], str]:
+    """Ask the bypass browser to solve a challenge and return a cookie jar.
+
+    ``target_url`` is the page the browser actually loads, and it matters:
+    Cloudflare applies challenge rules per path, so a clearance minted on
+    /dashboard is not necessarily accepted for /api/v1/projects/<id>. Minting on
+    the request a claim will make keeps the two consistent.
 
     Returns ``(cookies, user_agent)``. The UA must be replayed on every later
     request: a clearance issued to one UA is rejected when presented with
     another (verified: same cookie + default UA -> 403 challenge).
     """
     base = cf_bypass_url()
-    params = {"url": f"{CDK_BASE}/dashboard"}
+    # /dashboard remains the fallback: it is the page the bypass browser is
+    # known to warm up on, and an expired project can answer 404 there.
+    params = {"url": str(target_url or "").strip() or f"{CDK_BASE}/dashboard"}
     if force:
         params["force"] = "true"
     endpoint = f"{base}/cookies?{urlencode(params)}"
@@ -484,12 +493,14 @@ def _mint_clearance(
 ) -> tuple[dict[str, str], str, bool]:
     """Ask the bypass browser for a session and validate it against ``probe_url``.
 
-    ``force`` makes the bypass drop its own cached browser session first, and that
-    is what "get a *new* clearance" means: without it the service hands back the
-    very session that was just rejected, and the retry repeats the same 403.
+    The browser loads the very URL the session will be used for, so the challenge
+    is solved on the same path (and by the same rule set) as the claim. ``force``
+    makes the bypass drop its own cached browser session first, and that is what
+    "get a *new* clearance" means: without it the service hands back the very
+    session that was just rejected, and the retry repeats the same 403.
     """
     try:
-        cookies, ua = fetch_cdk_clearance(force=force)
+        cookies, ua = fetch_cdk_clearance(force=force, target_url=probe_url)
     except Exception as exc:
         logger.warning(
             "cdk clearance mint failed force=%s error_type=%s", force, type(exc).__name__
@@ -502,7 +513,6 @@ def _mint_clearance(
         )
         return {}, "", False
     return cookies, ua, verify_clearance(cookies, ua, session_id, probe_url)
-
 
 def cached_clearance(
     session_id: str = "", probe_url: str = "", *, force: bool = False
