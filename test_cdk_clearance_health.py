@@ -7,6 +7,7 @@ same dead session otherwise) which the claim then uses immediately.
 """
 import ast
 import logging
+import os
 import time
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ CACHE_NAMES = {
     'refresh_clearance_if_stale', 'drop_clearance_cache',
     'clearance_probe_url', 'claim_probe_url', 'remember_cdk_link',
 }
+FINGERPRINT_NAMES = {'probe_clearance', '_impersonate_candidates'}
 
 
 def _subset(names):
@@ -36,8 +38,35 @@ def verifier_namespace(client):
         '_new_client': Mock(return_value=client),
         '_browser_headers': lambda *a: {},
         '_challenge_like': lambda r: 'Just a moment' in r.text,
+        'os': os,
+        'active_impersonate': lambda: 'firefox133',
+        'remember_impersonate': Mock(),
     }
     exec(compile(_subset({'verify_clearance'}), str(SOURCE), 'exec'), ns)
+    return ns
+
+
+def fingerprinter_namespace(passing, candidates=None):
+    """Namespace holding the *real* probe_clearance with verify_clearance stubbed."""
+    tried = []
+
+    def fake_verify(cookies, user_agent, session_id='', url='', impersonate=''):
+        tried.append(impersonate)
+        return impersonate in passing
+
+    ns = {
+        'logger': Mock(), 'os': os,
+        'DEFAULT_IMPERSONATE': 'firefox133',
+        '_IMPERSONATE_FALLBACKS': ('firefox133', 'firefox135', 'firefox144', 'firefox'),
+        'verify_clearance': fake_verify,
+        'remember_impersonate': Mock(),
+        '_active_impersonate': '',
+        '_preset_supported_cache': {},
+        '_preset_supported': lambda name: name in (candidates or ()),
+        'curl_requests': None,
+    }
+    exec(compile(_subset(FINGERPRINT_NAMES), str(SOURCE), 'exec'), ns)
+    ns['tried'] = tried
     return ns
 
 
@@ -59,6 +88,7 @@ def namespace():
         'cdk_clearance_probe_seconds': lambda: 600,
         'load_cdk_session': lambda **kw: SimpleNamespace(ok=False),
         'verify_clearance': Mock(return_value=True),
+        'probe_clearance': Mock(return_value=True),
         'fetch_cdk_clearance': Mock(return_value=({'cf_clearance': 'fresh'}, 'UA')),
     }
     exec(compile(_subset(CACHE_NAMES), str(SOURCE), 'exec'), ns)
@@ -76,8 +106,9 @@ class ValidationTests(unittest.TestCase):
         cases = [
             (200, '', '', True), (204, '', '', True),
             (404, '', '', True),  # reached the origin: clearance was accepted
+            (401, '', '', True),  # "未登录": CF cleared, app has no session cookie
             (403, 'challenge', '', False), (200, 'challenge', '', False),
-            (403, '', 'Just a moment', False), (401, '', '', False),
+            (403, '', 'Just a moment', False), (401, 'challenge', '', False),
             (403, '', '', False), (429, '', '', False), (503, '', '', False),
         ]
         for status, header, body, expected in cases:
@@ -87,6 +118,19 @@ class ValidationTests(unittest.TestCase):
                 ns = verifier_namespace(client)
                 self.assertEqual(expected, ns['verify_clearance']({'cf_clearance': 'fake'}, 'UA'))
                 client.close.assert_called_once()
+
+    def test_preset_is_recorded_only_when_cloudflare_accepts_it(self):
+        client = Mock()
+        client.get.return_value = response(401)
+        ns = verifier_namespace(client)
+        ns['verify_clearance']({'cf_clearance': 'x'}, 'UA')
+        self.assertEqual(['firefox133'], [c.args[0] for c in ns['remember_impersonate'].call_args_list])
+
+        challenged = Mock()
+        challenged.get.return_value = response(403, 'challenge')
+        ns = verifier_namespace(challenged)
+        ns['verify_clearance']({'cf_clearance': 'x'}, 'UA')
+        ns['remember_impersonate'].assert_not_called()
 
     def test_missing_credentials_are_not_probed(self):
         client = Mock()
@@ -103,6 +147,59 @@ class ValidationTests(unittest.TestCase):
         client.close.assert_called_once()
 
 
+class FingerprintTests(unittest.TestCase):
+    """The TLS preset decides the outcome, so it must be discovered, not assumed."""
+
+    def test_probe_walks_presets_until_one_is_accepted(self):
+        ns = fingerprinter_namespace(
+            passing={'firefox144'},
+            candidates={'firefox133', 'firefox135', 'firefox144'},
+        )
+        self.assertTrue(ns['probe_clearance']({'cf_clearance': 'x'}, 'UA'))
+        self.assertEqual(['firefox133', 'firefox135', 'firefox144'], ns['tried'])
+
+    def test_probe_stops_at_the_first_accepted_preset(self):
+        ns = fingerprinter_namespace(
+            passing={'firefox135'}, candidates={'firefox133', 'firefox135'}
+        )
+        self.assertTrue(ns['probe_clearance']({'cf_clearance': 'x'}, 'UA'))
+        self.assertEqual(['firefox133', 'firefox135'], ns['tried'])
+
+    def test_probe_reports_failure_only_after_every_preset(self):
+        ns = fingerprinter_namespace(passing=set(), candidates={'firefox133', 'firefox135'})
+        self.assertFalse(ns['probe_clearance']({'cf_clearance': 'x'}, 'UA'))
+        self.assertEqual(['firefox133', 'firefox135'], ns['tried'])
+
+    def test_unsupported_presets_are_dropped(self):
+        ns = fingerprinter_namespace(passing=set(), candidates={'firefox133'})
+        self.assertEqual(('firefox133',), ns['_impersonate_candidates']())
+
+    def test_the_known_good_preset_is_tried_first(self):
+        ns = fingerprinter_namespace(
+            passing=set(), candidates={'firefox133', 'firefox135', 'firefox144'}
+        )
+        # firefox144 is the preset the old code hard-coded and Cloudflare rejected.
+        self.assertEqual('firefox133', ns['_impersonate_candidates']()[0])
+
+    def test_env_override_wins(self):
+        ns = fingerprinter_namespace(
+            passing=set(), candidates={'firefox135', 'firefox133'}
+        )
+        os.environ['CDK_IMPERSONATE'] = 'firefox135'
+        try:
+            self.assertEqual('firefox135', ns['_impersonate_candidates']()[0])
+        finally:
+            del os.environ['CDK_IMPERSONATE']
+
+    def test_a_typo_in_the_env_cannot_break_every_request(self):
+        ns = fingerprinter_namespace(passing=set(), candidates={'firefox133'})
+        os.environ['CDK_IMPERSONATE'] = 'not-a-browser'
+        try:
+            self.assertEqual(('firefox133',), ns['_impersonate_candidates']())
+        finally:
+            del os.environ['CDK_IMPERSONATE']
+
+
 class RefreshTests(unittest.TestCase):
 
     def test_cold_start_tries_bypass_cache_before_force(self):
@@ -115,7 +212,7 @@ class RefreshTests(unittest.TestCase):
 
     def test_unvalidated_mint_is_never_reported_healthy(self):
         ns = namespace()
-        ns['verify_clearance'] = Mock(return_value=False)
+        ns['probe_clearance'] = Mock(return_value=False)
         result = ns['refresh_clearance_if_stale']()
         self.assertFalse(result['ok'])
         self.assertEqual(0.0, ns['_probe_state']['last_probe_at'])
@@ -134,7 +231,7 @@ class RefreshTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('no usable session', result['error'])
         self.assertEqual({}, ns['_clearance_cache']['cookies'])
-        ns['verify_clearance'].assert_not_called()
+        ns['probe_clearance'].assert_not_called()
 
     def test_recent_verified_cache_is_reused_without_network(self):
         ns = namespace()
@@ -142,7 +239,7 @@ class RefreshTests(unittest.TestCase):
         ns['_probe_state'].update(last_probe_at=time.time(), verified=True)
         self.assertTrue(ns['refresh_clearance_if_stale']()['ok'])
         ns['fetch_cdk_clearance'].assert_not_called()
-        ns['verify_clearance'].assert_not_called()
+        ns['probe_clearance'].assert_not_called()
 
     def test_stale_but_accepted_cache_is_reused(self):
         ns = namespace()
@@ -157,7 +254,7 @@ class RefreshTests(unittest.TestCase):
         ns['_clearance_cache'].update(cookies={'cf_clearance': 'dead'}, user_agent='UA')
         ns['_probe_state']['last_probe_at'] = time.time() - 1000
         # The cached session is rejected; the freshly minted one is accepted.
-        ns['verify_clearance'] = Mock(side_effect=[False, True])
+        ns['probe_clearance'] = Mock(side_effect=[False, True])
         cookies, ua = ns['cached_clearance'](session_id='sid')
         # The bypass still holds 'dead' in its own cache, so the refresh must be
         # forced or the retry replays the same rejected session.
@@ -172,7 +269,7 @@ class RefreshTests(unittest.TestCase):
         cookies, ua = ns['cached_clearance'](session_id='sid', force=True)
         self.assertEqual([True], force_flags(ns))
         self.assertEqual('fresh', cookies['cf_clearance'])
-        ns['verify_clearance'].assert_called_once()
+        ns['probe_clearance'].assert_called_once()
 
     def test_validation_uses_the_caller_target(self):
         ns = namespace()
@@ -181,7 +278,7 @@ class RefreshTests(unittest.TestCase):
         )
         self.assertEqual(
             'https://cdk.example/api/v1/projects/abc',
-            ns['verify_clearance'].call_args.args[3],
+            ns['probe_clearance'].call_args.args[3],
         )
 
     def test_probe_target_prefers_the_project_api(self):

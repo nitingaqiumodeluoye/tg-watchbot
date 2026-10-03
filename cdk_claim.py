@@ -59,6 +59,63 @@ DEFAULT_CLIENT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0"
 )
 
+# curl_cffi selects the TLS/JA4 fingerprint on its own; the User-Agent header does
+# not influence it. Cloudflare binds cf_clearance to that fingerprint, so the
+# preset -- not the cookie and not the UA -- decides whether a request passes.
+# Measured on cdk.linux.do against one freshly minted clearance with the bypass UA
+# (Firefox 144): firefox133 reached the origin 3/3 while firefox135, firefox144 and
+# the bare firefox alias were challenged 0/3 each. curl_cffi's firefox144 is the
+# preset this code used to hard-code, which is why every CDK request was 403.
+DEFAULT_IMPERSONATE = "firefox133"
+_IMPERSONATE_FALLBACKS = ("firefox133", "firefox135", "firefox144", "firefox")
+_active_impersonate = ""
+_preset_supported_cache: dict[str, bool] = {}
+
+
+def _preset_supported(name: str) -> bool:
+    """Whether curl_cffi knows this impersonate target (cached, no network)."""
+    if not name:
+        return False
+    if name not in _preset_supported_cache:
+        try:
+            if curl_requests is None:
+                raise RuntimeError("curl_cffi missing")
+            curl_requests.Session(impersonate=name).close()
+            _preset_supported_cache[name] = True
+        except Exception:
+            _preset_supported_cache[name] = False
+    return _preset_supported_cache[name]
+
+
+def _impersonate_candidates() -> tuple[str, ...]:
+    """Presets to try, best-known first; ``CDK_IMPERSONATE`` overrides them all.
+
+    Unsupported names are dropped rather than attempted, so a typo in the
+    environment cannot turn into a stream of failed CDK requests.
+    """
+    order: list[str] = []
+    for name in (
+        os.getenv("CDK_IMPERSONATE", "").strip(),
+        _active_impersonate,
+        *_IMPERSONATE_FALLBACKS,
+    ):
+        if name and name not in order and _preset_supported(name):
+            order.append(name)
+    return tuple(order) or (DEFAULT_IMPERSONATE,)
+
+
+def active_impersonate() -> str:
+    """The preset to use: the one Cloudflare accepted last, else the default."""
+    return _active_impersonate or _impersonate_candidates()[0]
+
+
+def remember_impersonate(name: str) -> None:
+    """Pin the preset that just worked so claims keep using it."""
+    global _active_impersonate
+    if name and name != _active_impersonate:
+        _active_impersonate = name
+        logger.info("cdk impersonate preset accepted: %s", name)
+
 
 @dataclass
 class ClaimResult:
@@ -431,7 +488,11 @@ def clearance_probe_url() -> str:
 
 
 def verify_clearance(
-    cookies: dict[str, str], user_agent: str, session_id: str = "", url: str = ""
+    cookies: dict[str, str],
+    user_agent: str,
+    session_id: str = "",
+    url: str = "",
+    impersonate: str = "",
 ) -> bool:
     """Check a candidate clearance still passes cdk.linux.do.
 
@@ -444,8 +505,13 @@ def verify_clearance(
     The probe target matters as much as the probe itself: pointing it at a path
     Cloudflare samples would discard a perfectly healthy clearance and pay for a
     new browser challenge. Hence the give-away link, not user-info.
+
+    ``impersonate`` is the curl_cffi TLS preset; it is the single strongest
+    factor, so callers walk the candidates via :func:`probe_clearance` instead of
+    giving up after one rejected fingerprint.
     """
     target = url or clearance_probe_url()
+    preset = impersonate or active_impersonate()
     if not cookies.get("cf_clearance") or not user_agent:
         logger.warning("cdk clearance validation failed url=%s reason=missing_credentials", target)
         return False
@@ -454,7 +520,7 @@ def verify_clearance(
         jar["linux_do_cdk_session_id"] = session_id
     client = None
     try:
-        client = _new_client(user_agent, jar)
+        client = _new_client(user_agent, jar, impersonate=preset)
         resp = client.get(
             target,
             headers=_browser_headers(target, user_agent),
@@ -462,22 +528,28 @@ def verify_clearance(
         )
         mitigated = str(resp.headers.get("cf-mitigated", "")).strip().lower()
         challenged = mitigated == "challenge" or _challenge_like(resp)
-        # Cloudflare accepted the session when the request reached the origin:
-        # 2xx answers do, and a 404 (an expired give-away) does too. 401/403/429
-        # and 5xx prove nothing, so they must never count as healthy.
+        # Cloudflare accepted the session whenever the request reached the
+        # origin: 2xx does, and so do 404 (expired give-away) and 401 (the app
+        # answered "未登录", which is the tell-tale of a cleared challenge with no
+        # session cookie attached). 403/429 without origin headers prove nothing,
+        # so they must never count as healthy.
         verified = not challenged and (
-            200 <= resp.status_code < 300 or resp.status_code == 404
+            200 <= resp.status_code < 300 or resp.status_code in (401, 404)
         )
+        if verified:
+            remember_impersonate(preset)
         logger.log(
             logging.INFO if verified else logging.WARNING,
-            "cdk clearance validation url=%s status=%s cf_mitigated=%s challenge=%s verified=%s",
-            target, resp.status_code, mitigated or "none", challenged, verified,
+            "cdk clearance validation url=%s status=%s cf_mitigated=%s challenge=%s "
+            "verified=%s impersonate=%s",
+            target, resp.status_code, mitigated or "none", challenged, verified, preset,
         )
         return verified
     except Exception as exc:
         logger.warning(
-            "cdk clearance validation failed url=%s reason=request_error error_type=%s",
-            target, type(exc).__name__,
+            "cdk clearance validation failed url=%s reason=request_error "
+            "impersonate=%s error_type=%s",
+            target, preset, type(exc).__name__,
         )
         return False
     finally:
@@ -486,6 +558,22 @@ def verify_clearance(
                 client.close()
             except Exception:
                 pass
+
+
+def probe_clearance(
+    cookies: dict[str, str], user_agent: str, session_id: str = "", url: str = ""
+) -> bool:
+    """Validate a clearance against every fingerprint candidate in turn.
+
+    The cookie and the User-Agent can both be flawless and still be rejected when
+    the TLS fingerprint is wrong, so a single rejected preset says nothing about
+    the session's health. Costs nothing extra: these are direct API requests, not
+    browser challenges.
+    """
+    for preset in _impersonate_candidates():
+        if verify_clearance(cookies, user_agent, session_id, url, impersonate=preset):
+            return True
+    return False
 
 
 def _mint_clearance(
@@ -512,7 +600,8 @@ def _mint_clearance(
             force, len(cookies), bool(ua),
         )
         return {}, "", False
-    return cookies, ua, verify_clearance(cookies, ua, session_id, probe_url)
+    return cookies, ua, probe_clearance(cookies, ua, session_id, probe_url)
+
 
 def cached_clearance(
     session_id: str = "", probe_url: str = "", *, force: bool = False
@@ -535,7 +624,7 @@ def cached_clearance(
     if not force and cached.get("cookies") and cached["cookies"].get("cf_clearance"):
         if now - float(_probe_state.get("last_probe_at") or 0.0) < cdk_clearance_probe_seconds():
             return cached["cookies"], cached["user_agent"]
-        if verify_clearance(cached["cookies"], cached["user_agent"], session_id, target):
+        if probe_clearance(cached["cookies"], cached["user_agent"], session_id, target):
             _probe_state.update({"last_probe_at": now, "verified": True})
             return cached["cookies"], cached["user_agent"]
         logger.info("cdk clearance no longer accepted, minting a fresh one url=%s", target)
@@ -820,15 +909,15 @@ def _browser_headers(referer: str, ua: str) -> dict[str, str]:
     }
 
 
-def _new_client(user_agent: str, cookies: dict[str, str]):
-    """curl_cffi session (browser TLS) with cookies preloaded."""
+def _new_client(user_agent: str, cookies: dict[str, str], impersonate: str = ""):
+    """curl_cffi session with a browser TLS fingerprint and cookies preloaded.
+
+    The fingerprint has to match the browser that solved the challenge, and the
+    UA header has to be the one that browser reported; both are replayed here.
+    """
     if curl_requests is None:
         raise RuntimeError("curl_cffi is required for cdk claims")
-    # firefox143 matches the bypass browser that minted the clearance.
-    try:
-        client = curl_requests.Session(impersonate="firefox144")
-    except Exception:
-        client = curl_requests.Session(impersonate="firefox133")
+    client = curl_requests.Session(impersonate=impersonate or active_impersonate())
     client.headers["User-Agent"] = user_agent
     for name, value in cookies.items():
         client.cookies.set(name, value, domain=".linux.do")
