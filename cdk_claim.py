@@ -239,6 +239,66 @@ def cdk_cf_retry_limit() -> int:
         return 1
 
 
+CDK_MINT_BUDGET_DEFAULT = 2
+# A bypass cache hit answers in tens of milliseconds; launching camoufox to solve
+# a challenge took 10.1-20.6s across every sample on 2026-10-03. Anything in
+# between is a challenge solve, so the threshold only has to be broadly central.
+CDK_MINT_SLOW_SECONDS = 5.0
+
+
+def cdk_mint_budget() -> int:
+    """Browser sessions one claim may spend solving Cloudflare challenges.
+
+    Every session is a real challenge solve (10-20s), and solving challenges is
+    what provokes the rate limiting that killed the session in the first place,
+    so a claim that keeps re-minting makes its own problem worse. Observed on
+    2026-10-03: one failed claim launched four browsers in 54s. Two is enough for
+    the honest cases (first mint, plus one refresh after a challenge); anything
+    beyond that is a loop, and the claim is better off reporting cloudflare and
+    letting the next round try.
+    """
+    try:
+        return max(1, min(6, int(os.getenv("CDK_MINT_BUDGET", str(CDK_MINT_BUDGET_DEFAULT)))))
+    except ValueError:
+        return CDK_MINT_BUDGET_DEFAULT
+
+
+@dataclass
+class MintBudget:
+    """Counts the browser sessions a single claim has spent, and caps them.
+
+    A budget belongs to one claim and is never shared: two monitors can claim
+    different projects concurrently, and one project's retries must not consume
+    the other's allowance.
+
+    Only *browser* sessions are charged. Distinguishing them from a free cache
+    hit is done by wall time, because that is the one signal that needs no
+    guesswork: the bypass answers from its own store in tens of milliseconds and
+    launches a camoufox browser when it has nothing cached, which was measured at
+    10-20s. A clearance value could not be used for this -- at cold start there is
+    no previous value to compare against, so every first mint would look like a
+    launched browser.
+    """
+
+    limit: int
+    slow_seconds: float = CDK_MINT_SLOW_SECONDS
+    used: int = 0
+
+    @property
+    def exhausted(self) -> bool:
+        return self.used >= self.limit
+
+    def spend(self) -> None:
+        self.used += 1
+
+    def charge_if_slow(self, elapsed: float) -> bool:
+        """Charge a browser session when the mint was too slow to be a cache hit."""
+        if elapsed >= self.slow_seconds:
+            self.spend()
+            return True
+        return False
+
+
 def cdk_start_wait_max_seconds() -> float:
     """How long a claim may sit waiting for the project's start_time.
 
@@ -626,7 +686,7 @@ def probe_clearance(
 
 
 def _mint_clearance(
-    session_id: str, probe_url: str, *, force: bool
+    session_id: str, probe_url: str, *, force: bool, budget: MintBudget | None = None
 ) -> tuple[dict[str, str], str, bool]:
     """Ask the bypass browser for a session and validate it against ``probe_url``.
 
@@ -635,7 +695,20 @@ def _mint_clearance(
     makes the bypass drop its own cached browser session first, and that is what
     "get a *new* clearance" means: without it the service hands back the very
     session that was just rejected, and the retry repeats the same 403.
+
+    Refuses to start once ``budget`` is spent, so a challenge loop dies at the
+    cap instead of feeding the rate limiting it is fighting.
     """
+    if budget is not None and budget.exhausted:
+        logger.warning(
+            "cdk mint budget exhausted used=%s/%s force=%s url=%s",
+            budget.used, budget.limit, force, probe_url,
+        )
+        return {}, "", False
+    if force and budget is not None:
+        # A forced mint always costs one: it is defined as "solve a new challenge".
+        budget.spend()
+    started = time.time()
     try:
         cookies, ua = fetch_cdk_clearance(force=force, target_url=probe_url)
     except Exception as exc:
@@ -643,17 +716,29 @@ def _mint_clearance(
             "cdk clearance mint failed force=%s error_type=%s", force, type(exc).__name__
         )
         return {}, "", False
+    elapsed = time.time() - started
     if not cookies.get("cf_clearance") or not ua:
         logger.warning(
             "cdk clearance mint incomplete force=%s cookies=%s ua=%s",
             force, len(cookies), bool(ua),
         )
         return {}, "", False
+    if not force and budget is not None and budget.charge_if_slow(elapsed):
+        # The bypass had no session of its own, so it solved a challenge even
+        # though the caller asked for a cheap one.
+        logger.info(
+            "cdk unforced mint solved a challenge elapsed=%.1fs used=%s/%s",
+            elapsed, budget.used, budget.limit,
+        )
     return cookies, ua, probe_clearance(cookies, ua, session_id, probe_url)
 
 
 def cached_clearance(
-    session_id: str = "", probe_url: str = "", *, force: bool = False
+    session_id: str = "",
+    probe_url: str = "",
+    *,
+    force: bool = False,
+    budget: MintBudget | None = None,
 ) -> tuple[dict[str, str], str]:
     """Return a cdk.linux.do clearance, minting a fresh one when the old fails.
 
@@ -666,6 +751,9 @@ def cached_clearance(
 
     ``force=True`` skips the cached session entirely, which is what a caller does
     after a request was challenged: mint a new clearance and use it immediately.
+
+    ``budget`` caps the browser sessions this call may spend; without one (the
+    periodic probe) minting is unlimited.
     """
     target = probe_url or clearance_probe_url()
     now = time.time()
@@ -686,7 +774,15 @@ def cached_clearance(
     # window, so it is retried with a forced refresh before being accepted.
     unvalidated: tuple[dict[str, str], str] = ({}, "")
     for use_force in ((True,) if force else (False, True)):
-        cookies, ua, verified = _mint_clearance(session_id, target, force=use_force)
+        if budget is not None and budget.exhausted:
+            logger.warning(
+                "cdk mint budget spent, giving up url=%s used=%s/%s",
+                target, budget.used, budget.limit,
+            )
+            break
+        cookies, ua, verified = _mint_clearance(
+            session_id, target, force=use_force, budget=budget
+        )
         if not cookies:
             continue
         unvalidated = (cookies, ua)
@@ -1161,14 +1257,17 @@ def post_receive(project_id: str, captcha_token: str, client) -> dict[str, Any]:
 # Orchestration
 # --------------------------------------------------------------------------- #
 
-def confirm_received(result: ClaimResult, session) -> None:
+def confirm_received(
+    result: ClaimResult, session, budget: MintBudget | None = None
+) -> None:
     """Re-read the project after a failed claim: the code may be ours anyway.
 
     A Cloudflare challenge or a timeout can hit the *response* of a POST the
     server had already committed. The project document still carries
     ``is_received``/``received_content``, and a first-come-first-served code can
     never be regenerated, so a failure is not accepted until the project has
-    been read back.
+    been read back. Shares the claim's ``budget`` so this last-chance read cannot
+    start a fresh round of challenge solving.
     """
     if result.ok or not result.project_id:
         return
@@ -1177,7 +1276,10 @@ def confirm_received(result: ClaimResult, session) -> None:
     for attempt_force in (False, True):
         try:
             cookies, ua = cached_clearance(
-                session_id=session.session_id, probe_url=probe_target, force=attempt_force
+                session_id=session.session_id,
+                probe_url=probe_target,
+                force=attempt_force,
+                budget=budget,
             )
             jar = dict(cookies)
             jar["linux_do_cdk_session_id"] = session.session_id
@@ -1226,9 +1328,12 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
 
     probe_target = claim_probe_url(result.project_id)
     remember_cdk_link(link)
+    # One budget per claim: it caps how many Cloudflare challenges this single
+    # give-away may cost, so a failing phase cannot cascade into a browser loop.
+    budget = MintBudget(limit=cdk_mint_budget())
     try:
         cookies, clear_ua = cached_clearance(
-            session_id=session.session_id, probe_url=probe_target
+            session_id=session.session_id, probe_url=probe_target, budget=budget
         )
     except Exception as exc:
         result.reason = "clearance_failed"
@@ -1254,11 +1359,22 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
         A challenged request means Cloudflare stopped accepting the session in
         hand, and the bypass service still holds that very session in its own
         cache, so the refresh has to be forced. Raises when no new session is
-        issued, which the caller reports as a Cloudflare failure.
+        issued, which the caller reports as a Cloudflare failure -- and raises the
+        same way once the claim's browser budget is spent, because the alternative
+        is solving challenges until the rate limiting wins.
         """
         nonlocal client, user_agent, jar
+        if budget.exhausted:
+            logger.warning(
+                "cdk mint budget spent, not solving another challenge project=%s used=%s/%s",
+                result.project_id, budget.used, budget.limit,
+            )
+            raise PermissionError("cloudflare")
         cookies, clear_ua = cached_clearance(
-            session_id=session.session_id, probe_url=probe_target, force=True
+            session_id=session.session_id,
+            probe_url=probe_target,
+            force=True,
+            budget=budget,
         )
         if "cf_clearance" not in cookies:
             raise PermissionError("cloudflare")
@@ -1444,7 +1560,7 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
     # A failure is not final until the project has been read back: the code may
     # have been handed out before the response was lost.
     if not result.ok and result.reason != "payment_required":
-        confirm_received(result, session)
+        confirm_received(result, session, budget)
     return result
 
 

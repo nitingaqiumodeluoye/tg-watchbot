@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -29,6 +30,7 @@ FINGERPRINT_NAMES = {
 # passing after the source changed, which is exactly the bug these guard against.
 CONSTANT_NAMES = {
     'DEFAULT_IMPERSONATE', '_IMPERSONATE_FALLBACKS', '_CLIENT_HINT_HEADERS',
+    'CDK_MINT_SLOW_SECONDS',
 }
 
 
@@ -43,6 +45,25 @@ def real_constants():
     ns = {}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(SOURCE), 'exec'), ns)
     return {k: ns[k] for k in CONSTANT_NAMES}
+
+
+def real_class(name):
+    """Build the real class of that name from the source.
+
+    The sliced modules do not carry ``from __future__ import annotations``, so
+    annotations are evaluated at def time and every name they mention must exist
+    in the namespace -- which is why this is needed at all.
+    """
+    tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
+    body = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+    assert body, f'class {name} not found in {SOURCE.name}'
+    ns = {'dataclass': dataclass, **real_constants()}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(SOURCE), 'exec'), ns)
+    return ns[name]
+
+
+MintBudget = real_class('MintBudget')
+CDK_MINT_SLOW_SECONDS = real_constants()['CDK_MINT_SLOW_SECONDS']
 
 
 NEW_CLIENT_NAMES = {'_new_client', '_preset_sends_client_hints'}
@@ -135,6 +156,8 @@ def namespace():
         '_probe_url_loaded': True,
         '_active_impersonate': '',
         '_preset_supported': lambda name: True,
+        'MintBudget': MintBudget,
+        'cdk_mint_budget': lambda: 2,
         '_load_persisted_probe_state': lambda: {},
         '_persist_probe_state': lambda **kw: None,
         'cdk_clearance_probe_seconds': lambda: 600,
@@ -197,6 +220,93 @@ class ValidationTests(unittest.TestCase):
         ns = verifier_namespace(client)
         self.assertFalse(ns['verify_clearance']({'cf_clearance': 'x'}, 'UA'))
         client.close.assert_called_once()
+
+
+class MintBudgetTests(unittest.TestCase):
+    """One claim must not be able to solve challenges without end.
+
+    Every browser session is a real challenge solve, and solving them is what
+    provokes the rate limiting that killed the session -- so the budget is the
+    brake that stops a failing claim from making its own situation worse.
+    """
+
+    def test_a_forced_mint_always_costs_one(self):
+        ns = namespace()
+        budget = MintBudget(limit=2)
+        ns['cached_clearance'](session_id='sid', probe_url='https://cdk.example/x', force=True, budget=budget)
+        self.assertEqual(1, budget.used)
+        self.assertFalse(budget.exhausted)
+
+    def test_a_fast_mint_is_a_cache_hit_and_costs_nothing(self):
+        # The bypass answers from its own store in tens of milliseconds: no
+        # challenge was solved, so it must not consume the allowance.
+        ns = namespace()
+        budget = MintBudget(limit=2)
+        ns['cached_clearance'](session_id='sid', budget=budget)
+        self.assertEqual(0, budget.used)
+
+    def test_a_slow_unforced_mint_is_charged_as_a_browser(self):
+        # Nothing cached on the bypass side => it launched a browser and solved a
+        # challenge, even though the caller only asked for a cheap cache hit.
+        ns = namespace()
+        ns['fetch_cdk_clearance'] = Mock(side_effect=lambda **kw: (time.sleep(0.08), ({'cf_clearance': 'x'}, 'UA'))[1])
+        budget = MintBudget(limit=2, slow_seconds=0.05)
+        ns['cached_clearance'](session_id='sid', budget=budget)
+        self.assertEqual(1, budget.used)
+
+    def test_the_charge_threshold_sits_between_cache_hit_and_browser(self):
+        # Measured: cache hits 24-200ms, browser launches 10.1-20.6s.
+        self.assertGreater(CDK_MINT_SLOW_SECONDS, 0.2)
+        self.assertLess(CDK_MINT_SLOW_SECONDS, 10.0)
+
+    def test_no_mint_happens_once_the_budget_is_spent(self):
+        ns = namespace()
+        budget = MintBudget(limit=2, used=2)
+        with self.assertRaises(RuntimeError):
+            ns['cached_clearance'](session_id='sid', force=True, budget=budget)
+        ns['fetch_cdk_clearance'].assert_not_called()
+        self.assertEqual(2, budget.used)
+
+    def test_the_cap_holds_across_repeated_refreshes(self):
+        """The 2026-10-03 loop must stop: it launched four browsers in one claim."""
+        ns = namespace()
+        ns['probe_clearance'] = Mock(return_value=False)  # every session is rejected
+        budget = MintBudget(limit=2)
+        for _ in range(6):
+            try:
+                ns['cached_clearance'](session_id='sid', force=True, budget=budget)
+            except RuntimeError:
+                pass
+        self.assertLessEqual(budget.used, 2)
+        # 2 forced mints, then every later call refuses without touching the bypass.
+        self.assertEqual(2, ns['fetch_cdk_clearance'].call_count)
+
+    def test_without_a_budget_minting_is_unlimited(self):
+        # The periodic probe deliberately has no budget: a single forced mint per
+        # ten minutes is not a loop, and capping it would leave the cache cold.
+        ns = namespace()
+        ns['probe_clearance'] = Mock(return_value=False)
+        for _ in range(4):
+            ns['cached_clearance'](session_id='sid', force=True)
+        self.assertEqual(4, ns['fetch_cdk_clearance'].call_count)
+
+    def test_limit_is_configurable_and_bounded(self):
+        for env, expected in (('', 2), ('1', 1), ('3', 3), ('99', 6), ('0', 1), ('junk', 2)):
+            with self.subTest(env=env):
+                ns = {'os': os, 'CDK_MINT_BUDGET_DEFAULT': 2}
+                body = [
+                    n for n in ast.parse(SOURCE.read_text(encoding='utf-8')).body
+                    if isinstance(n, ast.FunctionDef) and n.name == 'cdk_mint_budget'
+                ]
+                exec(compile(ast.Module(body=body, type_ignores=[]), str(SOURCE), 'exec'), ns)
+                if env:
+                    os.environ['CDK_MINT_BUDGET'] = env
+                else:
+                    os.environ.pop('CDK_MINT_BUDGET', None)
+                try:
+                    self.assertEqual(expected, ns['cdk_mint_budget']())
+                finally:
+                    os.environ.pop('CDK_MINT_BUDGET', None)
 
 
 class FingerprintTests(unittest.TestCase):
