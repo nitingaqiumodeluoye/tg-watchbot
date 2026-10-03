@@ -19,8 +19,59 @@ CACHE_NAMES = {
     '_mint_clearance', 'cached_clearance',
     'refresh_clearance_if_stale', 'drop_clearance_cache',
     'clearance_probe_url', 'claim_probe_url', 'remember_cdk_link',
+    'remember_impersonate',
 }
-FINGERPRINT_NAMES = {'probe_clearance', '_impersonate_candidates'}
+FINGERPRINT_NAMES = {
+    'probe_clearance', '_impersonate_candidates',
+    'remember_impersonate', 'active_impersonate', '_preset_sends_client_hints',
+}
+# Read the real constants instead of copying them: a duplicated list would keep
+# passing after the source changed, which is exactly the bug these guard against.
+CONSTANT_NAMES = {
+    'DEFAULT_IMPERSONATE', '_IMPERSONATE_FALLBACKS', '_CLIENT_HINT_HEADERS',
+}
+
+
+def real_constants():
+    tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
+    body = [
+        n for n in tree.body
+        if isinstance(n, (ast.Assign, ast.AnnAssign))
+        and getattr(n.targets[0] if isinstance(n, ast.Assign) else n.target, 'id', '')
+        in CONSTANT_NAMES
+    ]
+    ns = {}
+    exec(compile(ast.Module(body=body, type_ignores=[]), str(SOURCE), 'exec'), ns)
+    return {k: ns[k] for k in CONSTANT_NAMES}
+
+
+NEW_CLIENT_NAMES = {'_new_client', '_preset_sends_client_hints'}
+
+
+def namespace_for_hints():
+    """Namespace holding the real _preset_sends_client_hints and the hint table."""
+    ns = {'str': str, **real_constants()}
+    exec(compile(_subset(NEW_CLIENT_NAMES), str(SOURCE), 'exec'), ns)
+    return ns
+
+
+def namespace_for_new_client(record):
+    """Namespace with the real _new_client talking to a fake curl_cffi Session."""
+
+    class FakeClient:
+        def __init__(self, impersonate=None):
+            record['impersonate'] = impersonate
+            record['headers'] = {}
+            self.headers = record['headers']
+            self.cookies = SimpleNamespace(set=lambda *a, **k: None)
+
+    ns = {
+        'str': str, 'active_impersonate': lambda: 'safari184',
+        'curl_requests': SimpleNamespace(Session=FakeClient),
+        'RuntimeError': RuntimeError, **real_constants(),
+    }
+    exec(compile(_subset(NEW_CLIENT_NAMES), str(SOURCE), 'exec'), ns)
+    return ns
 
 
 def _subset(names):
@@ -56,10 +107,9 @@ def fingerprinter_namespace(passing, candidates=None):
 
     ns = {
         'logger': Mock(), 'os': os,
-        'DEFAULT_IMPERSONATE': 'firefox133',
-        '_IMPERSONATE_FALLBACKS': ('firefox133', 'firefox135', 'firefox144', 'firefox'),
+        **real_constants(),
         'verify_clearance': fake_verify,
-        'remember_impersonate': Mock(),
+        '_persist_probe_state': lambda **kw: None,
         '_active_impersonate': '',
         '_preset_supported_cache': {},
         '_preset_supported': lambda name: name in (candidates or ()),
@@ -83,6 +133,8 @@ def namespace():
         '_clearance_cache': {'cookies': {}, 'user_agent': ''},
         '_probe_state': {'last_probe_at': 0.0, 'url': '', 'verified': False, 'project_id': ''},
         '_probe_url_loaded': True,
+        '_active_impersonate': '',
+        '_preset_supported': lambda name: True,
         '_load_persisted_probe_state': lambda: {},
         '_persist_probe_state': lambda **kw: None,
         'cdk_clearance_probe_seconds': lambda: 600,
@@ -174,12 +226,43 @@ class FingerprintTests(unittest.TestCase):
         ns = fingerprinter_namespace(passing=set(), candidates={'firefox133'})
         self.assertEqual(('firefox133',), ns['_impersonate_candidates']())
 
-    def test_the_known_good_preset_is_tried_first(self):
+    def test_the_safari_preset_is_tried_first(self):
         ns = fingerprinter_namespace(
-            passing=set(), candidates={'firefox133', 'firefox135', 'firefox144'}
+            passing=set(), candidates={'firefox133', 'firefox135', 'firefox144', 'safari184'}
         )
-        # firefox144 is the preset the old code hard-coded and Cloudflare rejected.
-        self.assertEqual('firefox133', ns['_impersonate_candidates']()[0])
+        # Firefox presets send no Client Hints and get challenged, so they must not
+        # be the first thing every cold start pays a rejected request for.
+        self.assertEqual('safari184', ns['_impersonate_candidates']()[0])
+        self.assertEqual('safari184', real_constants()['DEFAULT_IMPERSONATE'])
+
+    def test_the_candidate_list_spans_several_browser_families(self):
+        fallbacks = real_constants()['_IMPERSONATE_FALLBACKS']
+        families = {n.split('1')[0].rstrip('_') for n in fallbacks}
+        for family in ('safari', 'chrome', 'firefox'):
+            self.assertIn(family, families)
+        self.assertGreaterEqual(len(fallbacks), 10)
+
+    def test_client_hints_are_defined_for_the_critical_ch_demand(self):
+        hints = real_constants()['_CLIENT_HINT_HEADERS']
+        for key in ('sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
+                    'sec-ch-ua-arch', 'sec-ch-ua-bitness', 'sec-ch-ua-full-version'):
+            self.assertIn(key, hints)
+
+    def test_only_firefox_presets_need_manual_client_hints(self):
+        ns = namespace_for_hints()
+        self.assertFalse(ns['_preset_sends_client_hints']('firefox133'))
+        self.assertFalse(ns['_preset_sends_client_hints']('firefox'))
+        self.assertTrue(ns['_preset_sends_client_hints']('safari184'))
+        self.assertTrue(ns['_preset_sends_client_hints']('chrome124'))
+
+    def test_new_client_attaches_hints_for_firefox_only(self):
+        for preset, expect in (('firefox133', True), ('safari184', False)):
+            with self.subTest(preset=preset):
+                made = {}
+                ns = namespace_for_new_client(made)
+                ns['_new_client']('UA', {'cf_clearance': 'x'}, impersonate=preset)
+                self.assertEqual(expect, 'sec-ch-ua' in made['headers'])
+                self.assertEqual(preset, made['impersonate'])
 
     def test_env_override_wins(self):
         ns = fingerprinter_namespace(
@@ -349,6 +432,49 @@ class RefreshTests(unittest.TestCase):
         self.assertEqual(
             ns['clearance_probe_url'](), ns['fetch_cdk_clearance'].call_args.kwargs['target_url']
         )
+
+    def test_persisted_preset_is_restored_after_a_restart(self):
+        ns = namespace()
+        ns['_probe_url_loaded'] = False
+        ns['_load_persisted_probe_state'] = lambda: {
+            'probe_project_id': 'from-disk', 'impersonate': 'safari180'
+        }
+        ns['_preset_supported'] = lambda name: name == 'safari180'
+        ns['clearance_probe_url']()
+        self.assertEqual('safari180', ns['_active_impersonate'])
+
+    def test_an_unsupported_persisted_preset_is_ignored(self):
+        ns = namespace()
+        ns['_probe_url_loaded'] = False
+        ns['_load_persisted_probe_state'] = lambda: {'impersonate': 'not-a-browser'}
+        ns['_preset_supported'] = lambda name: False
+        ns['clearance_probe_url']()
+        self.assertEqual('', ns['_active_impersonate'])
+
+    def test_mid_flight_challenge_does_not_discard_a_validated_clearance(self):
+        """claim_link's PermissionError handler must not drop the session.
+
+        Cloudflare's decision flaps (200 then 403 on the same URL 155ms apart), so
+        a challenged request is not evidence the clearance is dead; dropping it buys
+        another browser challenge for a session that may still be accepted.
+        """
+        tree = ast.parse(SOURCE.read_text(encoding='utf-8'))
+        func = next(
+            n for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == 'claim_link'
+        )
+        outer = next(
+            n for n in func.body
+            if isinstance(n, ast.Try)
+            and any(getattr(h.type, 'id', '') == 'PermissionError' for h in n.handlers)
+        )
+        handler = next(
+            h for h in outer.handlers
+            if getattr(h.type, 'id', '') == 'PermissionError'
+        )
+        code = ast.unparse(handler)
+        self.assertIn('_probe_state.update', code)
+        self.assertNotIn('drop_clearance_cache', code)
 
     def test_remembered_link_is_persisted(self):
         ns = namespace()

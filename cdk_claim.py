@@ -59,17 +59,58 @@ DEFAULT_CLIENT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101 Firefox/143.0"
 )
 
-# curl_cffi selects the TLS/JA4 fingerprint on its own; the User-Agent header does
-# not influence it. Cloudflare binds cf_clearance to that fingerprint, so the
-# preset -- not the cookie and not the UA -- decides whether a request passes.
-# Measured on cdk.linux.do against one freshly minted clearance with the bypass UA
-# (Firefox 144): firefox133 reached the origin 3/3 while firefox135, firefox144 and
-# the bare firefox alias were challenged 0/3 each. curl_cffi's firefox144 is the
-# preset this code used to hard-code, which is why every CDK request was 403.
-DEFAULT_IMPERSONATE = "firefox133"
-_IMPERSONATE_FALLBACKS = ("firefox133", "firefox135", "firefox144", "firefox")
+# curl_cffi picks the TLS/JA4 fingerprint on its own; the User-Agent header does
+# not influence it, and Cloudflare binds cf_clearance to that fingerprint.
+#
+# Cloudflare ALSO advertises Critical Client Hints on cdk.linux.do (the challenge
+# response carries `critical-ch: Sec-CH-UA-Bitness, Sec-CH-UA-Arch, ...`): a client
+# that does not echo them is handed a managed challenge however fresh its clearance
+# is. That is the trap this code fell into: curl_cffi's Firefox presets send no
+# Client Hints at all (Firefox does not implement them), so every CDK request 403'd
+# while the exact same cookie was accepted seconds earlier from the browser.
+#
+# Measured on cdk.linux.do with one freshly minted clearance:
+#   firefox133                -> 403, cf-mitigated=challenge
+#   firefox133 + Sec-CH-UA-*  -> 401 from the origin
+#   safari184 / chrome124     -> 401 from the origin (they emit their own hints)
+#   every Firefox preset      -> 403
+# So prefer a preset that emits Client Hints natively, and attach them by hand when
+# a caller forces a Firefox preset. The list spans families: whichever family
+# Cloudflare happens to accept is remembered, so the next change self-heals.
+DEFAULT_IMPERSONATE = "safari184"
+_IMPERSONATE_FALLBACKS = (
+    "safari184", "safari180", "safari2601", "safari", "safari_beta",
+    "chrome124", "chrome136", "chrome142", "chrome145", "chrome",
+    "edge101", "edge", "tor145",
+    "firefox133", "firefox135", "firefox144", "firefox147", "firefox",
+)
+
+# Client Hints are cross-checked against each other, not against the User-Agent:
+# a Firefox UA carrying Chromium hints was accepted, so these stay consistent
+# among themselves and are only added when the preset cannot emit them.
+_CLIENT_HINT_HEADERS = {
+    "sec-ch-ua": '"Chromium";v="142", "Not_A Brand";v="24", "Google Chrome";v="142"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Linux"',
+    "sec-ch-ua-arch": '"x86_64"',
+    "sec-ch-ua-bitness": '"64"',
+    "sec-ch-ua-full-version": '"142.0.7444.60"',
+    "sec-ch-ua-full-version-list": (
+        '"Chromium";v="142.0.7444.60", "Not_A Brand";v="24.0.0.0", '
+        '"Google Chrome";v="142.0.7444.60"'
+    ),
+}
 _active_impersonate = ""
 _preset_supported_cache: dict[str, bool] = {}
+
+
+def _preset_sends_client_hints(preset: str) -> bool:
+    """Whether curl_cffi already sends Client Hints for this preset.
+
+    Safari/Chrome/Edge builds do; Firefox (and therefore the camoufox browser that
+    minted the clearance) does not.
+    """
+    return not str(preset).lower().startswith("firefox")
 
 
 def _preset_supported(name: str) -> bool:
@@ -110,10 +151,16 @@ def active_impersonate() -> str:
 
 
 def remember_impersonate(name: str) -> None:
-    """Pin the preset that just worked so claims keep using it."""
+    """Pin the preset that just worked so claims keep using it.
+
+    Persisted alongside the probe URL: re-discovering a working preset costs one
+    rejected request per candidate, which is exactly what a first-come-first-served
+    claim cannot afford after a restart.
+    """
     global _active_impersonate
     if name and name != _active_impersonate:
         _active_impersonate = name
+        _persist_probe_state(impersonate=name)
         logger.info("cdk impersonate preset accepted: %s", name)
 
 
@@ -400,7 +447,7 @@ def _load_persisted_probe_state() -> dict[str, str]:
         with sqlite3.connect(f"file:{_probe_state_db()}?mode=ro", uri=True) as conn:
             rows = conn.execute(
                 "SELECT key, value FROM cdk_probe_state "
-                "WHERE key IN ('probe_url', 'probe_project_id')"
+                "WHERE key IN ('probe_url', 'probe_project_id', 'impersonate')"
             ).fetchall()
         return {str(k): str(v) for k, v in rows if v}
     except Exception:
@@ -469,18 +516,20 @@ def clearance_probe_url() -> str:
     global _probe_url_loaded
     if not _probe_url_loaded:
         _probe_url_loaded = True
-        if not _probe_state.get("url") or not _probe_state.get("project_id"):
-            saved = _load_persisted_probe_state()
-            if not _probe_state.get("url"):
-                _probe_state["url"] = saved.get("probe_url", "")
-            if not _probe_state.get("project_id"):
-                _probe_state["project_id"] = saved.get("probe_project_id", "")
+        saved = _load_persisted_probe_state()
+        if not _probe_state.get("url"):
+            _probe_state["url"] = saved.get("probe_url", "")
+        if not _probe_state.get("project_id"):
+            _probe_state["project_id"] = saved.get("probe_project_id", "")
         if not _probe_state.get("project_id"):
             # State written before the probe moved to the API only holds the page
             # URL, so recover the id from it instead of falling back to /dashboard.
             _probe_state["project_id"] = project_id_from_link(
                 str(_probe_state.get("url") or "")
             )
+        restored = str(saved.get("impersonate") or "").strip()
+        if restored and not _active_impersonate and _preset_supported(restored):
+            remember_impersonate(restored)
     api = claim_probe_url(str(_probe_state.get("project_id") or ""))
     if api:
         return api
@@ -912,13 +961,18 @@ def _browser_headers(referer: str, ua: str) -> dict[str, str]:
 def _new_client(user_agent: str, cookies: dict[str, str], impersonate: str = ""):
     """curl_cffi session with a browser TLS fingerprint and cookies preloaded.
 
-    The fingerprint has to match the browser that solved the challenge, and the
-    UA header has to be the one that browser reported; both are replayed here.
+    The fingerprint has to match the browser that solved the challenge, and the UA
+    header has to be the one that browser reported; both are replayed here. Client
+    Hints are added for presets that cannot send them, because Cloudflare demands
+    them via ``critical-ch`` and challenges any client that stays silent.
     """
     if curl_requests is None:
         raise RuntimeError("curl_cffi is required for cdk claims")
-    client = curl_requests.Session(impersonate=impersonate or active_impersonate())
+    preset = impersonate or active_impersonate()
+    client = curl_requests.Session(impersonate=preset)
     client.headers["User-Agent"] = user_agent
+    if not _preset_sends_client_hints(preset):
+        client.headers.update(_CLIENT_HINT_HEADERS)
     for name, value in cookies.items():
         client.cookies.set(name, value, domain=".linux.do")
     return client
@@ -1372,8 +1426,13 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
                 break
             time.sleep(1.0)
     except PermissionError:
-        # Clearance died mid-flight: drop it so the next attempt re-warms.
-        drop_clearance_cache()
+        # A challenged *request* does not prove the clearance is dead: it was
+        # validated seconds ago, and Cloudflare's challenge decision flaps (observed
+        # 200 then 403 on the same URL, same cookie, 155ms apart). Keep the session
+        # but clear its freshness stamp so the next use re-validates it instead of
+        # silently trusting it -- discarding it here buys another 10-20s browser
+        # challenge for a session Cloudflare may still accept.
+        _probe_state.update({"last_probe_at": 0.0, "verified": False})
         result.reason = "cloudflare"
         result.error = "cloudflare challenged the claim request"
     except Exception as exc:
