@@ -209,6 +209,17 @@ class RefreshTests(unittest.TestCase):
             'https://cdk.example/api/v1/projects/from-disk', ns['clearance_probe_url']()
         )
 
+    def test_legacy_state_without_project_id_is_migrated(self):
+        ns = namespace()
+        ns['_probe_url_loaded'] = False
+        # Pre-API state only stored the page URL.
+        ns['_load_persisted_probe_state'] = lambda: {
+            'probe_url': 'https://cdk.example/receive/legacy-id'
+        }
+        self.assertEqual(
+            'https://cdk.example/api/v1/projects/legacy-id', ns['clearance_probe_url']()
+        )
+
     def test_remembered_link_is_persisted(self):
         ns = namespace()
         saved = {}

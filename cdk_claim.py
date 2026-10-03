@@ -409,6 +409,12 @@ def clearance_probe_url() -> str:
                 _probe_state["url"] = saved.get("probe_url", "")
             if not _probe_state.get("project_id"):
                 _probe_state["project_id"] = saved.get("probe_project_id", "")
+        if not _probe_state.get("project_id"):
+            # State written before the probe moved to the API only holds the page
+            # URL, so recover the id from it instead of falling back to /dashboard.
+            _probe_state["project_id"] = project_id_from_link(
+                str(_probe_state.get("url") or "")
+            )
     api = claim_probe_url(str(_probe_state.get("project_id") or ""))
     if api:
         return api
