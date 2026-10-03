@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -306,9 +307,52 @@ def fetch_cdk_clearance(*, force: bool = False, timeout: int = 150) -> tuple[dic
 
 _clearance_cache: dict[str, Any] = {"cookies": {}, "user_agent": ""}
 
-# Probe bookkeeping. The clearance has no TTL: like the monitor's cf session it
-# is kept until a probe proves Cloudflare no longer accepts it.
-_probe_state: dict[str, Any] = {"last_probe_at": 0.0, "url": ""}
+# Probe bookkeeping. The clearance has no TTL: like the monitor's cf session it is
+# kept until Cloudflare stops accepting it. ``verified`` records the outcome of
+# the last validation, so a caller can tell "we hold a cookie" apart from
+# "Cloudflare accepted it".
+_probe_state: dict[str, Any] = {"last_probe_at": 0.0, "url": "", "verified": False}
+_probe_url_loaded = False
+
+
+def _probe_state_db() -> str:
+    return os.getenv("CDK_STATE_DB", "/app/tg-watchbot.sqlite3").strip()
+
+
+def _load_persisted_probe_url() -> str:
+    """Read back the last give-away probe target so a restart is not blind.
+
+    Kept in the monitor's sqlite file because that is the one path docker-compose
+    mounts; anything written inside the image is lost on the next rebuild, and an
+    empty memory sends the probe to /dashboard, which Cloudflare samples.
+    """
+    try:
+        with sqlite3.connect(f"file:{_probe_state_db()}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "SELECT value FROM cdk_probe_state WHERE key='probe_url'"
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+    except Exception:
+        return ""
+
+
+def _persist_probe_url(url: str) -> None:
+    if not url:
+        return
+    try:
+        with sqlite3.connect(_probe_state_db()) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS cdk_probe_state ("
+                "key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO cdk_probe_state(key, value) VALUES('probe_url', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (url,),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.debug("cdk probe url persist failed: %s", type(exc).__name__)
 
 
 def cdk_clearance_probe_seconds() -> float:
@@ -328,6 +372,17 @@ def remember_cdk_link(link: str) -> None:
     project_id = project_id_from_link(link)
     if project_id:
         _probe_state["url"] = f"{CDK_BASE}/receive/{project_id}"
+        _persist_probe_url(_probe_state["url"])
+
+
+def claim_probe_url(project_id: str) -> str:
+    """The URL a clearance is validated against before claiming ``project_id``.
+
+    Validation has to target something the claim itself needs to reach. A page
+    probe can pass while the project API is challenged, which is exactly how a
+    "healthy" clearance still produced a Cloudflare failure mid-claim.
+    """
+    return f"{CDK_BASE}/api/v1/projects/{project_id}" if project_id else ""
 
 
 def clearance_probe_url() -> str:
@@ -336,6 +391,11 @@ def clearance_probe_url() -> str:
     Falls back to the warmup page until a give-away has been seen, so the very
     first claim after a restart still has something valid to check against.
     """
+    global _probe_url_loaded
+    if not _probe_url_loaded:
+        _probe_url_loaded = True
+        if not _probe_state.get("url"):
+            _probe_state["url"] = _load_persisted_probe_url()
     return str(_probe_state.get("url") or "") or f"{CDK_BASE}/dashboard"
 
 
@@ -393,39 +453,87 @@ def verify_clearance(
                 pass
 
 
-def cached_clearance(session_id: str = "") -> tuple[dict[str, str], str]:
-    """Return a cdk.linux.do clearance, kept until a probe proves it dead.
+def _mint_clearance(
+    session_id: str, probe_url: str, *, force: bool
+) -> tuple[dict[str, str], str, bool]:
+    """Ask the bypass browser for a session and validate it against ``probe_url``.
 
-    Deliberately has no TTL, mirroring the monitor's cf session: minting one
-    costs 43-72s of headless browser time, and replacing a clearance the origin
-    is still happily accepting only feeds the rate limiting that breaks it.
-    Instead the cache is re-used as-is between probes, and re-minted only when
-    a probe says Cloudflare has stopped accepting it.
+    ``force`` makes the bypass drop its own cached browser session first, and that
+    is what "get a *new* clearance" means: without it the service hands back the
+    very session that was just rejected, and the retry repeats the same 403.
     """
+    try:
+        cookies, ua = fetch_cdk_clearance(force=force)
+    except Exception as exc:
+        logger.warning(
+            "cdk clearance mint failed force=%s error_type=%s", force, type(exc).__name__
+        )
+        return {}, "", False
+    if not cookies.get("cf_clearance") or not ua:
+        logger.warning(
+            "cdk clearance mint incomplete force=%s cookies=%s ua=%s",
+            force, len(cookies), bool(ua),
+        )
+        return {}, "", False
+    return cookies, ua, verify_clearance(cookies, ua, session_id, probe_url)
+
+
+def cached_clearance(
+    session_id: str = "", probe_url: str = "", *, force: bool = False
+) -> tuple[dict[str, str], str]:
+    """Return a cdk.linux.do clearance, minting a fresh one when the old fails.
+
+    Deliberately has no TTL, mirroring the monitor's cf session: minting one costs
+    43-72s of headless browser time, and replacing a clearance the origin is still
+    accepting only feeds the rate limiting that breaks it. Instead the cached
+    session is re-used as-is until a validation says Cloudflare stopped accepting
+    it -- and at that point the refresh must be *forced*, because the bypass still
+    holds that same rejected session in its own cache.
+
+    ``force=True`` skips the cached session entirely, which is what a caller does
+    after a request was challenged: mint a new clearance and use it immediately.
+    """
+    target = probe_url or clearance_probe_url()
     now = time.time()
     cached = _clearance_cache
-    if cached.get("cookies") and "cf_clearance" in cached["cookies"]:
+    if not force and cached.get("cookies") and cached["cookies"].get("cf_clearance"):
         if now - float(_probe_state.get("last_probe_at") or 0.0) < cdk_clearance_probe_seconds():
             return cached["cookies"], cached["user_agent"]
-        if verify_clearance(
-            cached["cookies"], cached["user_agent"], session_id, clearance_probe_url()
-        ):
-            _probe_state["last_probe_at"] = time.time()
+        if verify_clearance(cached["cookies"], cached["user_agent"], session_id, target):
+            _probe_state.update({"last_probe_at": now, "verified": True})
             return cached["cookies"], cached["user_agent"]
-        # The probe says it is no longer accepted: mint a fresh one.
+        logger.info("cdk clearance no longer accepted, minting a fresh one url=%s", target)
         drop_clearance_cache()
+        force = True
 
-    for force in (False, True):
-        cookies, ua = fetch_cdk_clearance(force=force)
-        if not cookies.get("cf_clearance") or not ua:
+    # A cold cache may still be served from the bypass's own session store, which
+    # costs no browser time; only a rejected session has to be forced.
+    # A mint that fails validation must not be trusted for the whole probe
+    # window, so it is retried with a forced refresh before being accepted.
+    unvalidated: tuple[dict[str, str], str] = ({}, "")
+    for use_force in ((True,) if force else (False, True)):
+        cookies, ua, verified = _mint_clearance(session_id, target, force=use_force)
+        if not cookies:
             continue
-        if verify_clearance(cookies, ua, session_id, clearance_probe_url()):
+        unvalidated = (cookies, ua)
+        if verified:
             _clearance_cache.update({"cookies": cookies, "user_agent": ua})
-            _probe_state["last_probe_at"] = time.time()
+            _probe_state.update({"last_probe_at": now, "verified": True})
             return cookies, ua
-    # Never expose an unverified candidate as a healthy cached session.
+        logger.warning(
+            "cdk clearance minted but not validated url=%s force=%s", target, use_force
+        )
+
+    if unvalidated[0]:
+        # Cloudflare never confirmed the session, but it exists: hand it over so
+        # the claim can try and report the real error, while last_probe_at stays
+        # at zero and the health probe keeps calling it unverified.
+        _clearance_cache.update({"cookies": unvalidated[0], "user_agent": unvalidated[1]})
+        _probe_state.update({"last_probe_at": 0.0, "verified": False})
+        return unvalidated
+
     drop_clearance_cache()
-    raise RuntimeError("CDK clearance validation failed; no verified session available")
+    raise RuntimeError("CDK clearance unavailable: bypass returned no usable session")
 
 
 def refresh_clearance_if_stale(*, force: bool = False) -> dict[str, Any]:
@@ -451,8 +559,10 @@ def refresh_clearance_if_stale(*, force: bool = False) -> dict[str, Any]:
             "url": clearance_probe_url(),
             "error": f"{type(exc).__name__}: {exc}"[:200],
         }
+    # ``ok`` means Cloudflare accepted the session, not merely that a cookie was
+    # handed back; a mint that failed validation must not be reported as healthy.
     return {
-        "ok": bool(cookies.get("cf_clearance") and ua),
+        "ok": bool(cookies.get("cf_clearance") and ua and _probe_state.get("verified")),
         "url": clearance_probe_url(),
         "verified_at": float(_probe_state.get("last_probe_at") or 0.0),
         "ua": ua,
@@ -461,7 +571,7 @@ def refresh_clearance_if_stale(*, force: bool = False) -> dict[str, Any]:
 
 def drop_clearance_cache() -> None:
     _clearance_cache.update({"cookies": {}, "user_agent": ""})
-    _probe_state["last_probe_at"] = 0.0
+    _probe_state.update({"last_probe_at": 0.0, "verified": False})
 
 
 # --------------------------------------------------------------------------- #
@@ -883,15 +993,28 @@ def confirm_received(result: ClaimResult, session) -> None:
     """
     if result.ok or not result.project_id:
         return
-    try:
-        cookies, ua = cached_clearance(session_id=session.session_id)
-        jar = dict(cookies)
-        jar["linux_do_cdk_session_id"] = session.session_id
-        client = _new_client(ua, jar)
-        info = get_project_info(result.project_id, client)
-    except Exception as exc:
-        logger.info("cdk confirm skipped project=%s: %s", result.project_id, exc)
-        return
+    probe_target = claim_probe_url(result.project_id)
+    info: dict[str, Any] = {}
+    for attempt_force in (False, True):
+        try:
+            cookies, ua = cached_clearance(
+                session_id=session.session_id, probe_url=probe_target, force=attempt_force
+            )
+            jar = dict(cookies)
+            jar["linux_do_cdk_session_id"] = session.session_id
+            client = _new_client(ua, jar)
+            info = get_project_info(result.project_id, client)
+            break
+        except Exception as exc:
+            if attempt_force:
+                logger.info("cdk confirm skipped project=%s: %s", result.project_id, exc)
+                return
+            # The read-back is the last chance to recover a code that was
+            # actually issued, so a challenged first read buys a fresh clearance.
+            logger.info(
+                "cdk confirm challenged, retrying with a new clearance project=%s",
+                result.project_id,
+            )
     if info.get("is_received") and info.get("received_content"):
         logger.info("cdk claim confirmed despite reported failure project=%s", result.project_id)
         result.ok = True
@@ -922,8 +1045,12 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
         result.error = f"no linux_do_cdk_session_id at {cdk_session_file()}"
         return result
 
+    probe_target = claim_probe_url(result.project_id)
+    remember_cdk_link(link)
     try:
-        cookies, clear_ua = cached_clearance(session_id=session.session_id)
+        cookies, clear_ua = cached_clearance(
+            session_id=session.session_id, probe_url=probe_target
+        )
     except Exception as exc:
         result.reason = "clearance_failed"
         result.error = f"cf bypass: {exc}"[:300]
@@ -941,6 +1068,26 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
     jar["linux_do_cdk_session_id"] = session.session_id
 
     client = _new_client(user_agent, jar)
+
+    def renew_client() -> None:
+        """Replace the clearance with a brand new one and rebuild the client.
+
+        A challenged request means Cloudflare stopped accepting the session in
+        hand, and the bypass service still holds that very session in its own
+        cache, so the refresh has to be forced. Raises when no new session is
+        issued, which the caller reports as a Cloudflare failure.
+        """
+        nonlocal client, user_agent, jar
+        cookies, clear_ua = cached_clearance(
+            session_id=session.session_id, probe_url=probe_target, force=True
+        )
+        if "cf_clearance" not in cookies:
+            raise PermissionError("cloudflare")
+        user_agent = clear_ua or user_agent
+        jar = dict(cookies)
+        jar["linux_do_cdk_session_id"] = session.session_id
+        client = _new_client(user_agent, jar)
+
     try:
         # A project query can be challenged even when the cached clearance
         # recently passed the /receive probe. Refresh once and retry the query
@@ -959,14 +1106,7 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
                     "project=%s retry=%d",
                     result.project_id, project_cf_retries,
                 )
-                drop_clearance_cache()
-                cookies, clear_ua = cached_clearance(session_id=session.session_id)
-                if "cf_clearance" not in cookies:
-                    raise PermissionError("cloudflare")
-                user_agent = clear_ua or user_agent
-                jar = dict(cookies)
-                jar["linux_do_cdk_session_id"] = session.session_id
-                client = _new_client(user_agent, jar)
+                renew_client()
         result.project_name = str(info.get("name") or "")
         if info.get("is_received"):
             result.already_received = True
@@ -989,13 +1129,8 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
             # must not forfeit a claimable give-away: refresh the clearance,
             # retry once, then carry on with those two gates unknown.
             logger.info("cdk user-info challenged, refreshing clearance and retrying")
-            drop_clearance_cache()
             try:
-                cookies, clear_ua = cached_clearance(session_id=session.session_id)
-                user_agent = clear_ua or user_agent
-                jar = dict(cookies)
-                jar["linux_do_cdk_session_id"] = session.session_id
-                client = _new_client(user_agent, jar)
+                renew_client()
                 user = get_user_info(client)
             except Exception as exc:
                 logger.info("cdk user-info unavailable (%s), trust/score gates skipped", exc)
@@ -1063,14 +1198,7 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
                     "project=%s retry=%d",
                     result.project_id, receive_cf_retries,
                 )
-                drop_clearance_cache()
-                cookies, clear_ua = cached_clearance(session_id=session.session_id)
-                if "cf_clearance" not in cookies:
-                    raise PermissionError("cloudflare")
-                user_agent = clear_ua or user_agent
-                jar = dict(cookies)
-                jar["linux_do_cdk_session_id"] = session.session_id
-                client = _new_client(user_agent, jar)
+                renew_client()
                 # The next loop iteration solves a fresh hCaptcha token too.
                 continue
             error_msg = str(data.get("error_msg") or "").strip()
