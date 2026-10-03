@@ -2762,6 +2762,54 @@ def cf_direct_alert_needed(monitor: dict[str, Any]) -> bool:
     return True
 
 
+def monitor_is_derived_fetch(monitor: dict[str, Any]) -> bool:
+    """True for the per-topic ``/raw/{id}`` fetches derived from a real monitor.
+
+    Only the monitor's own fetch decides that monitor's runtime status: a derived
+    body fetch is deliberately swallowed (``fetch_topic_body`` never raises), so a
+    failure there never reaches ``record_monitor_runtime`` and cannot show up in
+    the monitor's own failure alert.
+    """
+    cache_key_url = str(monitor.get("cf_cache_key_url") or "")
+    return bool(cache_key_url) and cache_key_url != str(monitor.get("url") or "")
+
+
+def monitor_consecutive_failures(monitor_name: str) -> int:
+    """Consecutive failed runs recorded for a monitor, straight from sqlite."""
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT consecutive_failures FROM monitor_runtime_status WHERE monitor_name=?",
+            (str(monitor_name),),
+        ).fetchone()
+    return int(row["consecutive_failures"]) if row else 0
+
+
+def cf_failure_covered_by_monitor_alert(monitor: dict[str, Any]) -> bool:
+    """Whether the monitor's own failure alert already reports this CF failure.
+
+    The Gotify warning exists for what the monitor alert cannot see: a *healthy*
+    monitor whose topic-body fetches keep being challenged. The two counters are
+    genuinely independent -- a single monitor tick can pay several CF rejections
+    (one per body fetch) but only ever counts as one failed run, and quiet hours
+    reset the monitor counter while the CF one just freezes -- so they must not be
+    merged. But when the failing fetch *is* the monitor's own fetch and the
+    monitor is at its threshold, both messages describe the same outage, and the
+    second one is pure noise.
+
+    The monitor's counter is compared *after* the current failure: at this point
+    ``record_monitor_runtime`` has not run yet for the tick that is failing.
+    """
+    settings = monitor_failure_alert_settings(monitor)
+    if not settings["enabled"]:
+        return False
+    if monitor_is_derived_fetch(monitor):
+        return False
+    name = str(monitor.get("name") or "unnamed")
+    if monitor_failure_alert_is_active(name):
+        return True
+    return monitor_consecutive_failures(name) + 1 >= int(settings["consecutive_failures"])
+
+
 async def notify_cf_direct_failure(
     monitor: dict[str, Any], failures: int, reason: str
 ) -> None:
@@ -2771,11 +2819,22 @@ async def notify_cf_direct_failure(
     loading every page through a headless browser (which solved a challenge a
     minute and made the rate limiting worse), the outage is reported and the
     monitor's own failure alert covers Telegram. Sent once per outage, at the
-    ``CF_DIRECT_FAILURE_LIMIT``-th consecutive rejection.
+    ``CF_DIRECT_FAILURE_LIMIT``-th consecutive rejection -- and not at all when
+    the monitor alert is already reporting the same outage.
     """
     if failures < cf_direct_failure_limit():
         return
     name = str(monitor.get("name") or "unnamed")
+    if cf_failure_covered_by_monitor_alert(monitor):
+        # Deliberately leaves the once-per-outage flag unset: if the outage
+        # outlives the monitor's own outage (e.g. the monitor starts succeeding
+        # again while the body fetches keep failing), the warning must still be
+        # able to fire on its own merits.
+        logger.info(
+            "cf direct failure warning suppressed monitor=%s failures=%s reason=monitor failure alert covers it",
+            name, failures,
+        )
+        return
     if not cf_direct_alert_needed(monitor):
         return
     await send_gotify(
@@ -2783,9 +2842,10 @@ async def notify_cf_direct_failure(
         "Cloudflare 直连持续失败，已不再浏览器回退并暂停预热\n"
         f"监控：{name}\n"
         f"URL：{monitor.get('url') or '-'}\n"
-        f"连续失败：{failures} 次\n"
+        f"连续失败：{failures} 次（按抓取计，非监控轮次）\n"
         f"原因：{reason or 'unknown'}\n"
         f"指纹：{', '.join(cf_impersonate_candidates(monitor, ''))}\n"
+        f"说明：该故障未被监控失败告警覆盖\n"
         f"时间：{now_iso()}",
     )
 

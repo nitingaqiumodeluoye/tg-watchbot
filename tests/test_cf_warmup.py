@@ -603,10 +603,14 @@ class CfDirectNoFallbackTests(unittest.IsolatedAsyncioTestCase):
         # not, or a handful of failing fetches costs half a minute.
         os.environ["CF_DIRECT_RETRY_DELAY_SECONDS"] = "0"
         os.environ["CF_DIRECT_RETRY_COUNT"] = "1"
+        # The Gotify warning asks whether the monitor alert already covers the
+        # outage; driven by a flag here so no test touches sqlite.
+        self.covers = False
         self._orig = {
             "fetch_with_cf_cookies": app.fetch_with_cf_cookies,
             "refresh_cf_cookie_cache": app.refresh_cf_cookie_cache,
             "send_gotify": app.send_gotify,
+            "cf_failure_covered_by_monitor_alert": app.cf_failure_covered_by_monitor_alert,
         }
 
     def tearDown(self):
@@ -648,6 +652,7 @@ class CfDirectNoFallbackTests(unittest.IsolatedAsyncioTestCase):
         app.fetch_with_cf_cookies = fake_direct
         app.refresh_cf_cookie_cache = fake_refresh
         app.send_gotify = fake_gotify
+        app.cf_failure_covered_by_monitor_alert = lambda monitor: self.covers
 
     def test_browser_mirror_helper_is_gone(self):
         # The /html fallback is removed, not merely unused.
@@ -721,6 +726,132 @@ class CfDirectNoFallbackTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 await app.fetch_url(None, monitor)
         self.assertEqual(len(self.notifications), 2)
+
+    async def test_warning_is_suppressed_when_monitor_alert_covers_it(self):
+        monitor = self._monitor()
+        os.environ["CF_DIRECT_FAILURE_LIMIT"] = "3"
+        self.covers = True
+        self._install()
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                await app.fetch_url(None, monitor)
+        # The Telegram monitor alert reports this outage; Gotify stays quiet.
+        self.assertEqual(self.notifications, [])
+        # Suppression is a notification decision only: the warmup is still
+        # throttled, which is the whole point of the CF counter.
+        self.assertGreater(app.cf_direct_blocked_seconds(monitor), 0)
+
+    async def test_suppressed_warning_can_still_fire_later(self):
+        monitor = self._monitor()
+        os.environ["CF_DIRECT_FAILURE_LIMIT"] = "3"
+        self.covers = True
+        self._install()
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                await app.fetch_url(None, monitor)
+        self.assertEqual(self.notifications, [])
+        # The monitor recovers, so its alert no longer covers anything -- but the
+        # CF path is still down. The warning must now be able to fire.
+        self.covers = False
+        app.cf_direct_failures[app.cf_cache_key(monitor)] = 0
+        app.cf_direct_block_until.pop(app.cf_cache_key(monitor), None)
+        for _ in range(3):
+            with self.assertRaises(RuntimeError):
+                await app.fetch_url(None, monitor)
+        self.assertEqual(len(self.notifications), 1)
+
+
+class CfAlertCoverageTests(unittest.TestCase):
+    """The Gotify warning must not duplicate the monitor failure alert.
+
+    Both counters default to 10 and advance together for a monitor that fails on
+    every tick, but they measure different things (per fetch vs per run) and are
+    reset by different events (quiet hours reset the monitor one, a successful
+    fetch resets the CF one), so they cannot simply be merged.
+    """
+
+    def setUp(self):
+        self._orig = {
+            "settings": app.monitor_failure_alert_settings,
+            "active": app.monitor_failure_alert_is_active,
+            "count": app.monitor_consecutive_failures,
+        }
+        self.enabled = True
+        self.active = False
+        self.count = 0
+        app.monitor_failure_alert_settings = lambda monitor=None: {
+            "enabled": self.enabled,
+            "consecutive_failures": 10,
+            "notify_recovery": True,
+            "empty_result_is_failure": True,
+        }
+        app.monitor_failure_alert_is_active = lambda name: self.active
+        app.monitor_consecutive_failures = lambda name: self.count
+
+    def tearDown(self):
+        app.monitor_failure_alert_settings = self._orig["settings"]
+        app.monitor_failure_alert_is_active = self._orig["active"]
+        app.monitor_consecutive_failures = self._orig["count"]
+
+    @staticmethod
+    def _monitor(**extra):
+        monitor = {
+            "name": "Linux.do 福利",
+            "url": "https://linux.do/c/welfare/36.json",
+            "cf_bypass": True,
+        }
+        monitor.update(extra)
+        return monitor
+
+    def test_own_fetch_at_the_threshold_is_covered(self):
+        # This fetch is the 10th failing run, so the monitor alert fires too.
+        self.count = 9
+        self.assertTrue(app.cf_failure_covered_by_monitor_alert(self._monitor()))
+
+    def test_own_fetch_below_the_threshold_is_not_covered(self):
+        self.count = 3
+        self.assertFalse(app.cf_failure_covered_by_monitor_alert(self._monitor()))
+
+    def test_already_active_alert_covers(self):
+        self.active = True
+        self.count = 0
+        self.assertTrue(app.cf_failure_covered_by_monitor_alert(self._monitor()))
+
+    def test_disabled_alerts_never_cover(self):
+        self.enabled = False
+        self.count = 99
+        self.active = True
+        self.assertFalse(app.cf_failure_covered_by_monitor_alert(self._monitor()))
+
+    def test_derived_body_fetch_is_never_covered(self):
+        # A /raw fetch never reaches record_monitor_runtime, so no monitor alert
+        # can possibly report it -- this is the case the Gotify warning exists for.
+        monitor = self._monitor(
+            url="https://linux.do/raw/123456",
+            cf_cache_key_url="https://linux.do/c/welfare/36.json",
+        )
+        self.count = 99
+        self.active = True
+        self.assertTrue(app.monitor_is_derived_fetch(monitor))
+        self.assertFalse(app.cf_failure_covered_by_monitor_alert(monitor))
+
+    def test_shared_cache_key_url_is_still_a_primary_fetch(self):
+        # Two real monitors may deliberately share a warmed session; that must not
+        # be mistaken for a derived body fetch and silence the warning forever.
+        monitor = self._monitor(
+            url="https://linux.do/c/welfare/36.json",
+            cf_cache_key_url="https://linux.do/c/welfare/36.json",
+        )
+        self.count = 9
+        self.assertFalse(app.monitor_is_derived_fetch(monitor))
+        self.assertTrue(app.cf_failure_covered_by_monitor_alert(monitor))
+
+    def test_no_cache_key_url_is_a_primary_fetch(self):
+        self.assertFalse(app.monitor_is_derived_fetch(self._monitor()))
+
+    def test_threshold_matches_the_monitor_config(self):
+        # default is the same 10 as failure_alerts.consecutive_failures
+        self.assertEqual(app.DEFAULT_MONITOR_FAILURE_ALERT_THRESHOLD, 10)
 
 
 class CfClientHintsTests(unittest.TestCase):
