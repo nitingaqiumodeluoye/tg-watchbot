@@ -24,6 +24,7 @@ asyncio loop with a 30-120s captcha poll.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -350,6 +351,47 @@ def retry_deadline(start_ts: float) -> float:
 # Session store (linux_do_cdk_session_id)
 # --------------------------------------------------------------------------- #
 
+# The token is signed and carries its own issue time as the first field of the
+# base64 payload (`<epoch>|<opaque>|...`), which is how its age is known at all.
+# Measured 2026-10-05: a token issued 2026-09-28T06:41:09Z stopped being accepted
+# at 2026-10-05T06:41:09Z -- the 10-minute probe saw 200 at 06:02:45Z and the
+# first 401 at 06:42:45Z, i.e. the boundary is bracketed to 96 seconds. So the
+# lifetime is exactly 7 days and expiry is a scheduled event, not an accident.
+CDK_SESSION_TTL_DAYS_DEFAULT = 7.0
+
+
+class LoginExpired(RuntimeError):
+    """The origin answered 未登录: the OAuth login session is dead.
+
+    A type of its own because no amount of Cloudflare work can repair it. Minting
+    a fresh clearance, solving another hCaptcha, or retrying all cost real time
+    and change nothing -- the *login* is gone, and only a new token fixes it. Kept
+    distinct from PermissionError("cloudflare") so no caller confuses the two,
+    which is exactly what made a dead login look like a challenge and burn 12-15s
+    of headless browser per give-away.
+    """
+
+
+# Strings the CDK app returns when the session cookie is missing or dead.
+LOGIN_DEAD_MARKERS = ("未登录", "请先登录", "登录已过期", "登录失效", "请登录")
+
+
+def login_dead_error(error_msg: Any) -> bool:
+    """Whether an application ``error_msg`` means "your login is gone"."""
+    text = str(error_msg or "")
+    return any(marker in text for marker in LOGIN_DEAD_MARKERS)
+
+
+def raise_for_app_error(data: dict[str, Any]) -> None:
+    """Turn a CDK ``error_msg`` into the matching exception, or return quietly."""
+    message = str((data or {}).get("error_msg") or "").strip()
+    if not message:
+        return
+    if login_dead_error(message):
+        raise LoginExpired(message)
+    raise RuntimeError(message)
+
+
 @dataclass
 class CdkSession:
     session_id: str = ""
@@ -363,6 +405,146 @@ class CdkSession:
 
 
 _session_cache: CdkSession | None = None
+
+# Panel-managed session, stored in the monitor's sqlite (the one path docker
+# compose mounts). Pasting it on the settings page beats editing cdk_session.json
+# over SSH, and sqlite has no quoting hazards: the value is base64 and contains
+# `=`, `+`, `/` and `|`.
+PANEL_SESSION_META_KEY = "cdk_session_id"
+PANEL_SESSION_COOKIE_NAME = "linux_do_cdk_session_id"
+
+
+def panel_session_id() -> str:
+    """The session pasted on the settings page, or "" when unset.
+
+    Read straight from ``app_meta`` rather than through app.py: this module is
+    imported *by* app.py, so it must not import it back. The table is created by
+    app.py; a missing or unreadable DB just means "nothing pasted yet".
+    """
+    try:
+        with sqlite3.connect(f"file:{_probe_state_db()}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "SELECT meta_value FROM app_meta WHERE meta_key=?",
+                (PANEL_SESSION_META_KEY,),
+            ).fetchone()
+    except Exception:
+        return ""
+    return str(row[0]).strip() if row and row[0] else ""
+
+
+def save_panel_session(session_id: str, *, user_agent: str = "") -> str:
+    """Store the login token where the panel and the bot both read it.
+
+    Written to sqlite (``app_meta``) because that file is the one path docker
+    compose mounts, so a container rebuild cannot lose it, and because the value
+    needs no quoting. Returns the normalised token.
+
+    Both writers go through here -- the panel field and the CLI -- so they can
+    never disagree: ``load_cdk_session`` prefers this store over the legacy file,
+    and a CLI sync that silently lost to a newer panel value would be a trap.
+    """
+    token = normalize_session_value(session_id)
+    if not token:
+        return ""
+    with sqlite3.connect(_probe_state_db()) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_meta ("
+            "meta_key TEXT PRIMARY KEY, meta_value TEXT, updated_at TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO app_meta(meta_key, meta_value, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(meta_key) DO UPDATE SET "
+            "meta_value=excluded.meta_value, updated_at=excluded.updated_at",
+            (PANEL_SESSION_META_KEY, token, now_iso()),
+        )
+        conn.commit()
+    forget_session_cache()
+    logger.info("cdk session stored (len=%s)", len(token))
+    return token
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def forget_session_cache() -> None:
+    """Drop the in-memory session so a freshly pasted value takes effect now."""
+    global _session_cache
+    _session_cache = None
+
+
+def normalize_session_value(raw: str) -> str:
+    """Accept what a browser hands out and return just the token, or raise.
+
+    People copy the value, `linux_do_cdk_session_id=<value>`, or a whole
+    ``Cookie:`` header. Rather than store something unusable and fail an hour
+    later on a give-away, the shape is checked here: the token is base64 of
+    ``<epoch>|<opaque>|...``, and anything without that timestamp is rejected with
+    a message saying what to copy instead. That matters most for the linux.do
+    ``_t`` cookie, which is the one credential people reach for and the one that
+    cannot log into cdk.linux.do.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    text = text.strip().strip("'\"").strip()
+    if text.lower().startswith("cookie:"):
+        text = text.split(":", 1)[1].strip()
+    # A whole cookie header / jar dump: keep only our own name.
+    if ";" in text or "\n" in text:
+        for part in re.split(r"[;\n]", text):
+            name, _, value = part.strip().partition("=")
+            if name.strip() == PANEL_SESSION_COOKIE_NAME and value.strip():
+                text = value.strip()
+                break
+        else:
+            raise ValueError(f"未找到 {PANEL_SESSION_COOKIE_NAME}= 字段")
+    elif "=" in text:
+        name, _, value = text.partition("=")
+        if name.strip() == PANEL_SESSION_COOKIE_NAME:
+            text = value.strip().strip("'\"").strip()
+    if not session_issued_at(text):
+        raise ValueError(
+            "这不是 CDK 登录态：应是在 cdk.linux.do 登录后名为 "
+            f"{PANEL_SESSION_COOKIE_NAME} 的 cookie，值形如 `MTc5...==`。"
+            "（linux.do 的 _t 无法用于 CDK，它只能用于福利区。）"
+        )
+    return text
+
+
+def session_issued_at(session_id: str) -> float:
+    """The issue time embedded in the token, or 0.0 when it cannot be read."""
+    head = str(session_id or "").split("--", 1)[0].strip()
+    if not head:
+        return 0.0
+    try:
+        raw = base64.urlsafe_b64decode(head + "=" * (-len(head) % 4))
+    except Exception:
+        return 0.0
+    first = raw.decode("utf-8", errors="replace").split("|", 1)[0].strip()
+    try:
+        value = float(first)
+    except ValueError:
+        return 0.0
+    # Guard against a non-epoch first field being read as one.
+    return value if 1_600_000_000 <= value <= 4_000_000_000 else 0.0
+
+
+def cdk_session_ttl_days() -> float:
+    return max(0.1, float(os.getenv("CDK_SESSION_TTL_DAYS", str(CDK_SESSION_TTL_DAYS_DEFAULT))))
+
+
+def session_remaining_seconds(session_id: str) -> float | None:
+    """Seconds until the token's 7-day lifetime elapses, or None if unknown.
+
+    Derived from the issue time embedded in the token rather than from
+    ``saved_at``: the operator may paste a token that was already hours old, and
+    it is the origin's clock that decides.
+    """
+    issued = session_issued_at(session_id)
+    if not issued:
+        return None
+    return issued + cdk_session_ttl_days() * 86400 - time.time()
 
 
 def load_cdk_session(*, refresh: bool = False) -> CdkSession:
@@ -398,7 +580,9 @@ def load_cdk_session(*, refresh: bool = False) -> CdkSession:
         raw_cookies = {}
 
     session_id = str(
-        data.get("linux_do_cdk_session_id")
+        os.getenv("CDK_SESSION_ID", "").strip()
+        or panel_session_id()
+        or data.get("linux_do_cdk_session_id")
         or raw_cookies.get("linux_do_cdk_session_id")
         or ""
     ).strip()
@@ -412,7 +596,12 @@ def load_cdk_session(*, refresh: bool = False) -> CdkSession:
 
 
 def save_cdk_session(session_id: str, *, user_agent: str = "", source: str = "sync") -> CdkSession:
-    """Persist a session cookie (used by the local sync helper / tests)."""
+    """Persist a session cookie (CLI sync / legacy path / tests).
+
+    Keeps ``cdk_session.json`` in sync for anything that still reads the file (and
+    for a hand-inspection), but the authoritative copy is the sqlite one the panel
+    writes; see :func:`save_panel_session`.
+    """
     global _session_cache
     path = cdk_session_file()
     payload = {
@@ -424,11 +613,16 @@ def save_cdk_session(session_id: str, *, user_agent: str = "", source: str = "sy
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=1)
+    try:
+        save_panel_session(session_id, user_agent=payload["user_agent"])
+    except Exception as exc:
+        # A standalone (no-sqlite) deployment must still work off the file.
+        logger.debug("cdk session sqlite store unavailable: %s", type(exc).__name__)
     _session_cache = CdkSession(
         session_id=session_id,
         user_agent=payload["user_agent"],
         saved_at=payload["saved_at"],
-        source=path,
+        source=source or path,
     )
     return _session_cache
 
@@ -1100,8 +1294,7 @@ def get_project_info(project_id: str, client) -> dict[str, Any]:
     if _challenge_like(resp):
         raise PermissionError("cloudflare")
     data = _parse_body(resp)
-    if data.get("error_msg"):
-        raise RuntimeError(str(data["error_msg"]))
+    raise_for_app_error(data)
     result = data.get("data", {})
     return result if isinstance(result, dict) else {}
 
@@ -1131,10 +1324,67 @@ def get_user_info(client) -> dict[str, Any]:
     if _challenge_like(resp):
         raise PermissionError("cloudflare")
     data = _parse_body(resp)
-    if data.get("error_msg"):
-        raise RuntimeError(str(data["error_msg"]))
+    raise_for_app_error(data)
     result = data.get("data", {})
     return result if isinstance(result, dict) else {}
+
+
+def check_login_state(session_id: str = "") -> dict[str, Any]:
+    """Ask the origin whether the stored login session is still accepted.
+
+    The clearance probe cannot answer this, and never could: :func:`verify_clearance`
+    deliberately counts a 401 as *proof Cloudflare was cleared* -- true, and
+    useless for the login, which is why the probe reported "ok" every ten minutes
+    for the nine hours the session was dead. This is the check that catches it.
+
+    Costs one request against the already-warm clearance: no browser, no captcha.
+    Returns ``account`` (the raw user-info document) so a caller can show the
+    name/score next to the verdict.
+    """
+    session = load_cdk_session(refresh=True)
+    session_id = str(session_id or session.session_id).strip()
+    base: dict[str, Any] = {
+        "remaining_seconds": session_remaining_seconds(session_id) if session_id else None,
+        "issued_at": session_issued_at(session_id) if session_id else 0.0,
+    }
+    if not session_id:
+        return {**base, "ok": False, "detail": "no session id stored"}
+    try:
+        cookies, ua = cached_clearance(session_id=session_id)
+    except Exception as exc:
+        return {**base, "ok": False, "detail": f"clearance unavailable: {type(exc).__name__}"}
+    if not cookies.get("cf_clearance"):
+        return {**base, "ok": False, "detail": "no cf_clearance", "account": {}}
+    jar = dict(cookies)
+    jar["linux_do_cdk_session_id"] = session_id
+    client = None
+    try:
+        client = _new_client(ua or session.user_agent, jar)
+        resp = client.get(
+            f"{CDK_BASE}/api/v1/oauth/user-info",
+            headers=_browser_headers(f"{CDK_BASE}/", ua or DEFAULT_CLIENT_UA),
+            timeout=cdk_claim_timeout_seconds(),
+        )
+        if _challenge_like(resp):
+            return {**base, "ok": False, "detail": "cloudflare challenged the probe"}
+        data = _parse_body(resp)
+        message = str(data.get("error_msg") or "").strip()
+        raw_account = data.get("data")
+        account = raw_account if isinstance(raw_account, dict) else {}
+        if message:
+            return {**base, "ok": False, "detail": message, "account": account}
+        if not account:
+            # A 2xx with no account is not a login either.
+            return {**base, "ok": False, "detail": f"user-info empty (HTTP {resp.status_code})"}
+        return {**base, "ok": True, "detail": "", "account": account}
+    except Exception as exc:
+        return {**base, "ok": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 @dataclass
@@ -1273,29 +1523,46 @@ def confirm_received(
         return
     probe_target = claim_probe_url(result.project_id)
     info: dict[str, Any] = {}
-    for attempt_force in (False, True):
+
+    def read_back(force: bool) -> dict[str, Any]:
+        cookies, ua = cached_clearance(
+            session_id=session.session_id,
+            probe_url=probe_target,
+            force=force,
+            budget=budget,
+        )
+        jar = dict(cookies)
+        jar["linux_do_cdk_session_id"] = session.session_id
+        return get_project_info(result.project_id, _new_client(ua, jar))
+
+    try:
+        info = read_back(False)
+    except LoginExpired as exc:
+        # Nothing Cloudflare-shaped can fix a dead login, so do not reach for the
+        # browser. Observed 2026-10-05: this branch used to fall through to a
+        # forced mint and spent 12.7s/14.8s per give-away on a challenge that was
+        # guaranteed to fail.
+        logger.info("cdk confirm skipped project=%s: login session is dead (%s)", result.project_id, exc)
+        return
+    except PermissionError:
+        # A challenged read-back is the one case a new clearance can help: the
+        # code may already be ours, and it can never be regenerated.
+        logger.info(
+            "cdk confirm challenged, retrying with a new clearance project=%s",
+            result.project_id,
+        )
         try:
-            cookies, ua = cached_clearance(
-                session_id=session.session_id,
-                probe_url=probe_target,
-                force=attempt_force,
-                budget=budget,
-            )
-            jar = dict(cookies)
-            jar["linux_do_cdk_session_id"] = session.session_id
-            client = _new_client(ua, jar)
-            info = get_project_info(result.project_id, client)
-            break
+            info = read_back(True)
+        except LoginExpired as exc:
+            logger.info("cdk confirm skipped project=%s: login session is dead (%s)", result.project_id, exc)
+            return
         except Exception as exc:
-            if attempt_force:
-                logger.info("cdk confirm skipped project=%s: %s", result.project_id, exc)
-                return
-            # The read-back is the last chance to recover a code that was
-            # actually issued, so a challenged first read buys a fresh clearance.
-            logger.info(
-                "cdk confirm challenged, retrying with a new clearance project=%s",
-                result.project_id,
-            )
+            logger.info("cdk confirm skipped project=%s: %s", result.project_id, exc)
+            return
+    except Exception as exc:
+        # Anything else is not worth a browser challenge; the cleanup below still
+        # runs, so a previously issued code is not lost either way.
+        logger.info("cdk confirm read-back failed project=%s: %s", result.project_id, exc)
     if info.get("is_received") and info.get("received_content"):
         logger.info("cdk claim confirmed despite reported failure project=%s", result.project_id)
         result.ok = True
@@ -1427,9 +1694,16 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
             try:
                 renew_client()
                 user = get_user_info(client)
+            except LoginExpired:
+                raise
             except Exception as exc:
                 logger.info("cdk user-info unavailable (%s), trust/score gates skipped", exc)
                 user = {}
+        except LoginExpired:
+            # A dead login must abort the whole claim: without an account there is
+            # no eligibility gate, and every later step (captcha, POST /receive)
+            # would be a guaranteed failure that still costs a captcha credit.
+            raise
         except Exception as exc:
             # A missing user-info must not block a claim: the precheck simply
             # cannot evaluate the trust-level/score gates without it.
@@ -1464,7 +1738,6 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
             result.error = "dry run: skipped captcha + receive"
             result.elapsed_ms = int((time.time() - started) * 1000)
             return result
-
         # Retry loop: right after the start_time the project can still report
         # no stock for a second or two, or reject a stale captcha token. Each
         # pass solves a fresh token and retries until the window closes. A CF
@@ -1500,6 +1773,12 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
             payload = data.get("data") or {}
             if not isinstance(payload, dict):
                 payload = {}
+            if login_dead_error(error_msg):
+                # Retrying cannot mint a login, and the message is the actionable
+                # part: it tells the operator to paste a new token.
+                result.reason = "not_logged_in"
+                result.error = error_msg
+                break
             # Paid giveaways are a normal business result, not a successful
             # claim: return the payment URL so the operator can complete it.
             if payload.get("require_payment"):
@@ -1551,6 +1830,15 @@ def claim_link(link: str, *, dry_run: bool = False, refresh_session: bool = Fals
         _probe_state.update({"last_probe_at": 0.0, "verified": False})
         result.reason = "cloudflare"
         result.error = "cloudflare challenged the claim request"
+    except LoginExpired as exc:
+        # Reported on its own, and never as "cloudflare": the distinction is what
+        # stops the caller from paying for a browser challenge that cannot help,
+        # and it turns an opaque "error" into an instruction.
+        result.reason = "not_logged_in"
+        result.error = (
+            f"CDK 登录态已失效（{exc}）；token 有效期 7 天，请在面板「设置」"
+            "重新粘贴 linux_do_cdk_session_id"
+        )
     except Exception as exc:
         result.reason = result.reason or "error"
         result.error = f"{type(exc).__name__}: {exc}"[:300]

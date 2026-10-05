@@ -204,6 +204,11 @@ cf_direct_block_until: dict[str, float] = {}
 # Cache keys whose Cloudflare outage has already been reported, so the warning is
 # sent once per outage instead of once per failing tick.
 cf_direct_alert_sent: dict[str, bool] = {}
+# Whether a dead CDK login has already been reported, so the warning is sent once
+# per outage rather than every ten minutes. Re-armed on recovery.
+cdk_login_alert_sent = False
+# The reason the last warning carried, so a *different* failure is still reported.
+cdk_login_alert_reported = ""
 DEFAULT_CF_DIRECT_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0"
 
 
@@ -3904,6 +3909,7 @@ async def _run_cdk_claim(
             "dry_run": "试运行（未真正提交）",
             "out_of_stock": "已抢光",
             "already_received": "已领取过",
+            "not_logged_in": "CDK 登录态已失效（需重新粘贴）",
             "no_session": "缺少会话（需同步 session）",
             "clearance_failed": "Cloudflare 凭证获取失败",
             "cloudflare": "Cloudflare 拦截",
@@ -4535,6 +4541,45 @@ def schedule_monitors(scheduler: AsyncIOScheduler) -> None:
     schedule_cdk_clearance_probe(scheduler)
 
 
+async def check_and_alert_cdk_login(login: dict[str, Any]) -> None:
+    """Report a dead CDK login once per outage; re-arm the warning on recovery.
+
+    The clearance probe reported "ok" every ten minutes for the nine hours this
+    login was dead (a 401 proves Cloudflare was cleared, which says nothing about
+    the session), so the login needs a check of its own -- and one that speaks up,
+    because the only external symptom is give-aways being missed.
+    """
+    global cdk_login_alert_sent, cdk_login_alert_reported
+    remaining = login.get("remaining_seconds")
+    days = f"{remaining / 86400:.1f} 天" if isinstance(remaining, (int, float)) else "未知"
+    account = login.get("account") or {}
+    who = account.get("username") or account.get("name") or account.get("id") or "-"
+    if login.get("ok"):
+        if cdk_login_alert_sent:
+            cdk_login_alert_sent = False
+            cdk_login_alert_reported = ""
+            logger.info("cdk login recovered")
+            await send_gotify(
+                "CDK 登录态已恢复",
+                f"账号：{who}\n剩余有效期：{days}\n时间：{now_iso()}",
+            )
+        return
+    detail = str(login.get("detail") or "未知")
+    if cdk_login_alert_sent and cdk_login_alert_reported == detail:
+        return
+    cdk_login_alert_sent = True
+    cdk_login_alert_reported = detail
+    logger.warning("cdk login rejected by origin: %s", detail)
+    await send_gotify(
+        "CDK 登录态失效",
+        "CDK 领取已无法工作：登录态被服务端拒绝\n"
+        f"原因：{detail}\n"
+        f"剩余有效期（按 token 签发时间推算）：{days}\n"
+        "处理：面板「设置」→「高级设置」→ CDK 登录态，重新粘贴 linux_do_cdk_session_id\n"
+        f"时间：{now_iso()}",
+    )
+
+
 async def cdk_clearance_probe_job() -> None:
     """Keep the cdk.linux.do clearance warm so a claim never starts cold.
 
@@ -4560,6 +4605,21 @@ async def cdk_clearance_probe_job() -> None:
             "cdk clearance probe failed url=%s error=%s",
             status.get("url"), status.get("error") or "no cf_clearance",
         )
+    # Clearing Cloudflare and being logged in are independent. `verify_clearance`
+    # counts a 401 as proof the challenge was cleared -- correct, and blind to the
+    # session, which is how a 7-day TTL expired unnoticed on 2026-10-05.
+    try:
+        login = await asyncio.to_thread(_cdk_claim.check_login_state)
+    except Exception as e:
+        logger.warning("cdk login check crashed: %s", e)
+        return
+    if login:
+        if login.get("ok"):
+            logger.info(
+                "cdk login ok session_days_left=%.1f",
+                (login.get("remaining_seconds") or 0) / 86400,
+            )
+        await check_and_alert_cdk_login(login)
 
 
 def schedule_cdk_clearance_probe(scheduler: AsyncIOScheduler) -> None:
@@ -4661,6 +4721,31 @@ button:active{{transform:translate(2px,2px)}}
   *,*::before,*::after{{animation:none!important;transition:none!important}}
 }}
 </style></head><body><main class=login-card><div class=logo><i></i></div><h1>tg-watchbot</h1><p>登录后管理 Telegram 机器人、关键词监控和提醒。</p>{err}<form method=post action=/login><label>用户名</label><input name=username autocomplete=username autofocus><label>密码</label><input name=password type=password autocomplete=current-password><button type=submit>登录面板</button></form><div class=foot>localhost panel</div></main></body></html>"""
+
+
+def cdk_session_status_text() -> str:
+    """One-line description of the stored CDK login, for the settings page.
+
+    Deliberately offline: the page must not trigger a browser clearance mint just
+    to render. Whether the login is actually *accepted* is what the timer job
+    checks every 10 minutes, and a failure there pushes a Gotify warning.
+    """
+    try:
+        import cdk_claim as _cdk_claim
+    except Exception as exc:
+        return f"不可用：{exc}"
+    try:
+        session_id = _cdk_claim.load_cdk_session().session_id
+    except Exception as exc:
+        return f"读取失败：{exc}"
+    if not session_id:
+        return "❌ 未配置，CDK 领取不可用"
+    remaining = _cdk_claim.session_remaining_seconds(session_id)
+    if remaining is None:
+        return "⚠️ 已配置（无法从 token 读取签发时间，有效期未知）"
+    if remaining <= 0:
+        return "❌ 已过期，请重新粘贴登录态"
+    return f"✅ 已配置，按签发时间推算剩余约 {remaining / 86400:.1f} 天"
 
 
 def env_values() -> dict[str, str]:
@@ -5585,6 +5670,7 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
         status = "" if bot_ready else "<div class=msg>未填写 Token 或管理员 ID；网页可用，但 Bot 和监控推送不可用。</div>"
         login_row = telegram_login_status_row()
         env_session = v.get("TG_API_SESSION", "").strip()
+        cdk_session_status = cdk_session_status_text()
         if login_row.get("status") == "authorized":
             login_status = "已登录"
             login_user = login_row.get("username") or login_row.get("phone") or login_row.get("user_id") or "-"
@@ -5611,6 +5697,10 @@ HostLoc|https://hostloc.com|VPS,补货,优惠"""
 <div class=step><div class=step-title><span class=step-no>3</span><span>高级设置</span></div>
 <p class=muted>一般保持默认即可。</p>
 <label>Linux.do 福利区登录 Cookie（可选，留空则不带登录态）</label><textarea name=LINUXDO_COOKIE placeholder='_t=... 或直接填 _t 的值'>{html_escape(v.get('LINUXDO_COOKIE',''))}</textarea>
+<h3>CDK 登录态</h3>
+<p class=muted>抢 CDK 用的登录态。在浏览器登录 <code>cdk.linux.do</code> 后，从 Cookie 里复制 <code>linux_do_cdk_session_id</code> 的值粘到下面。有效期 7 天，过期后请重新粘贴（失效时机器人会推送告警）。<br>注意：这里要的是 CDK 的登录态，不是 linux.do 的 <code>_t</code>（<code>_t</code> 只能用于福利区，无法登录 CDK）。</p>
+<p class=muted>当前状态：{cdk_session_status}</p>
+<textarea name=CDK_SESSION_ID placeholder='留空保持不变；粘贴新的会覆盖。形如 MTc5...==（不要粘贴 _t）'></textarea>
 <div class=grid><div><label>日志级别</label><input name=LOG_LEVEL value='{html_escape(v['LOG_LEVEL'])}'></div><div><label>面板监听地址</label><input name=WEB_PANEL_HOST value='{html_escape(v['WEB_PANEL_HOST'])}'></div><div><label>面板端口</label><input name=WEB_PANEL_PORT value='{html_escape(v['WEB_PANEL_PORT'])}'></div><div><label>面板用户</label><input name=WEB_PANEL_USER value='{html_escape(v['WEB_PANEL_USER'])}'></div><div><label>面板密码</label><input name=WEB_PANEL_PASSWORD value='{html_escape(v['WEB_PANEL_PASSWORD'])}'></div></div>
 <h3>自动清理</h3><div class=grid><div><label>清理间隔（分钟）</label><input name=CLEANUP_INTERVAL_MINUTES type=number min=1 value='{html_escape(cleanup.get("interval_minutes", 60))}'></div><div><label>通知删除时间（分钟）</label><input name=CLEANUP_MESSAGE_DELETE_AFTER_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_message_delete_after_minutes", 60))}'></div><div><label>保留监控数据（分钟）</label><input name=CLEANUP_RETENTION_MINUTES type=number min=1 value='{html_escape(cleanup.get("monitor_retention_minutes", 1440))}'></div></div>
 </div>
@@ -5650,8 +5740,42 @@ async function logoutTgSession() {{
         cleanup_interval_minutes: int,
         cleanup_message_delete_after_minutes: int,
         cleanup_retention_minutes: int,
-    ) -> None:
+    ) -> str:
         write_env_values(values)
+        # The CDK login lives in sqlite rather than .env: the value is base64 with
+        # `=`, `+`, `/` and `|`, it must take effect immediately without a restart,
+        # and app_meta already survives the container rebuilds that would wipe a
+        # file written inside the image.
+        cdk_note = ""
+        pasted = str(values.get("CDK_SESSION_ID") or "").strip()
+        if pasted:
+            try:
+                import cdk_claim as _cdk_claim
+                token = _cdk_claim.normalize_session_value(pasted)
+                app_meta_set(
+                    _cdk_claim.PANEL_SESSION_META_KEY,
+                    token,
+                    )
+                _cdk_claim.forget_session_cache()
+                verdict = _cdk_claim.check_login_state(token)
+                if verdict.get("ok"):
+                    account = verdict.get("account") or {}
+                    who = account.get("username") or account.get("name") or "-"
+                    days = verdict.get("remaining_seconds")
+                    cdk_note = (
+                        f"<div class=msg>CDK 登录态已更新并验证通过（账号 {html_escape(str(who))}，"
+                        f"剩余约 {days / 86400:.1f} 天）。</div>" if isinstance(days, (int, float))
+                        else f"<div class=msg>CDK 登录态已更新并验证通过。</div>"
+                    )
+                else:
+                    cdk_note = (
+                        "<div class=msg>⚠️ CDK 登录态已保存，但服务端拒绝："
+                        f"{html_escape(str(verdict.get('detail') or '未知'))}</div>"
+                    )
+            except ValueError as exc:
+                cdk_note = f"<div class=msg>⚠️ CDK 登录态未保存：{html_escape(str(exc))}</div>"
+            except Exception as exc:
+                cdk_note = f"<div class=msg>⚠️ CDK 登录态校验异常：{html_escape(str(exc))}</div>"
         cfg = cfg_load_fresh()
         cfg["cleanup"] = {
             "enabled": True,
@@ -5660,11 +5784,12 @@ async function logoutTgSession() {{
             "monitor_retention_minutes": max(1, int(cleanup_retention_minutes)),
         }
         cfg_save(cfg)
+        return cdk_note
 
     @app.post("/settings", response_class=HTMLResponse)
-    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LINUXDO_COOKIE: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
-        save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
-        return layout("已保存", "<div class=msg>已保存并已重载监控任务（Cookie 类配置即时生效）；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
+    async def settings_save(_: str = Depends(panel_auth), TELEGRAM_BOT_TOKEN: str = Form(""), ADMIN_CHAT_ID: str = Form(""), LINUXDO_COOKIE: str = Form(""), CDK_SESSION_ID: str = Form(""), TG_API_ID: str = Form(""), TG_API_HASH: str = Form(""), TG_API_SESSION: str = Form(""), TG_PROXY: str = Form(""), LOG_LEVEL: str = Form("INFO"), WEB_PANEL_ENABLED: str = Form("true"), WEB_PANEL_HOST: str = Form("127.0.0.1"), WEB_PANEL_PORT: str = Form("8765"), WEB_PANEL_USER: str = Form("admin"), WEB_PANEL_PASSWORD: str = Form("admin"), CLEANUP_INTERVAL_MINUTES: int = Form(60), CLEANUP_MESSAGE_DELETE_AFTER_MINUTES: int = Form(60), CLEANUP_RETENTION_MINUTES: int = Form(1440)) -> str:
+        cdk_note = save_panel_settings(locals() | {"WEB_PANEL_ENABLED": WEB_PANEL_ENABLED}, CLEANUP_INTERVAL_MINUTES, CLEANUP_MESSAGE_DELETE_AFTER_MINUTES, CLEANUP_RETENTION_MINUTES)
+        return layout("已保存", f"{cdk_note}<div class=msg>已保存并已重载监控任务（Cookie 类配置即时生效）；修改 Token/管理员 ID 后请重启。</div><p><a class=btn href='/settings'>返回</a> <a class=btn href='/restart'>重启机器人</a></p>")
 
 
     @app.get("/send", response_class=HTMLResponse)

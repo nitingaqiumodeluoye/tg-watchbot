@@ -40,6 +40,21 @@ def cmd_check() -> int:
     if not session.ok:
         print("\n[HINT] sync a session first: --sync-session <cookie value>")
         return 1
+    # The clearance check above cannot see a dead login (it counts a 401 as proof
+    # Cloudflare was cleared), and `session ok: True` only means a value is
+    # present. This is the check that actually answers "can we still claim?".
+    state = cdk_claim.check_login_state()
+    remaining = state.get("remaining_seconds")
+    print("login        :", "OK" if state.get("ok") else "FAILED")
+    if not state.get("ok"):
+        print("  reason     :", state.get("detail") or "unknown")
+    if isinstance(remaining, (int, float)):
+        print(f"  expires in : {remaining / 86400:.2f} days (7-day token TTL)")
+    if not state.get("ok"):
+        print("\n[HINT] a dead login cannot be fixed by Cloudflare work; paste a new")
+        print("       linux_do_cdk_session_id on the panel settings page, or run")
+        print("       --sync-session <cookie value>")
+        return 1
     return 0
 
 
